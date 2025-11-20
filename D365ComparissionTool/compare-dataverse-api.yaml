@@ -1,0 +1,124 @@
+openapi: 3.0.1
+info:
+  title: Dataverse Environment Comparison API
+  version: 1.0.0
+  description: Compare active (statecode=0) records for a Dataverse entity between two environments and return a diff report.
+servers:
+  - url: https://d365comparissiontool-cdbtfdbjajhderca.westus-01.azurewebsites.net/
+    description: Production host
+security:
+  - FunctionKeyAuth: []
+paths:
+  /api/CompareDataverse:
+    post:
+      summary: Compare active records
+      operationId: compareDataverse
+      tags: [Comparison]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ComparisonRequest'
+            examples:
+              basic:
+                value:
+                  SourceEnvUrl: https://mash.crm.dynamics.com
+                  TargetEnvUrl: https://mashtest.crm.dynamics.com
+                  EntityLogicalName: mash_serviceoption
+                  FieldsToCompare: [ mash_name, mash_description ]
+      responses:
+        '200':
+          description: Diff report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiffReport'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalid:
+                  value: { code: BadRequest, message: Invalid request payload }
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                server:
+                  value: { code: ServerError, message: Unexpected failure }
+components:
+  securitySchemes:
+    FunctionKeyAuth:
+      type: apiKey
+      in: header
+      name: x-functions-key
+      description: Azure Functions host key passed in header x-functions-key.
+  schemas:
+    ComparisonRequest:
+      type: object
+      required: [SourceEnvUrl, TargetEnvUrl, EntityLogicalName, FieldsToCompare]
+      properties:
+        SourceEnvUrl: { type: string, format: uri }
+        TargetEnvUrl: { type: string, format: uri }
+        EntityLogicalName: { type: string, description: Logical name of entity (primary key inferred as logicalname + 'id'). }
+        FieldsToCompare:
+          type: array
+          minItems: 1
+          items: { type: string }
+        SourceTokenGenerationEndpoint: { type: string, format: uri, nullable: true }
+        SourceAppClientId: { type: string, nullable: true }
+        SourceResourceTenantId: { type: string, nullable: true }
+        SourceMiClientId: { type: string, nullable: true }
+        SourceScope: { type: string, nullable: true }
+        TokenGenerationEndpoint: { type: string, format: uri, nullable: true }
+        AppClientId: { type: string, nullable: true }
+        ResourceTenantId: { type: string, nullable: true }
+        MiClientId: { type: string, nullable: true }
+        Scope: { type: string, nullable: true }
+    MismatchDetail:
+      type: object
+      required: [RecordId, FieldName]
+      properties:
+        RecordId: { type: string, format: uuid }
+        FieldName: { type: string }
+        SourceValue: { type: string, nullable: true }
+        TargetValue: { type: string, nullable: true }
+    MultiFieldMismatch:
+      type: object
+      required: [RecordId, FieldMismatches]
+      properties:
+        RecordId: { type: string, format: uuid }
+        FieldMismatches:
+          type: array
+          items: { $ref: '#/components/schemas/MismatchDetail' }
+    DiffReport:
+      type: object
+      properties:
+        OnlyInSource:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        OnlyInTarget:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        Mismatches:
+          type: array
+          items: { $ref: '#/components/schemas/MismatchDetail' }
+        MultiFieldMismatches:
+          type: array
+          items: { $ref: '#/components/schemas/MultiFieldMismatch' }
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
