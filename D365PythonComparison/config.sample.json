@@ -1,0 +1,38 @@
+{
+  "_comment": "Sample configuration file - Copy this to config.json and fill in your details",
+  "_warning": "DO NOT COMMIT THIS FILE WITH REAL CREDENTIALS!",
+  
+  "authentication": {
+    "method": "client_credentials",
+    "client_id": "your-client-id-here",
+    "client_secret": "your-client-secret-here",
+    "tenant_id": "your-tenant-id-here"
+  },
+  
+  "environments": {
+    "dev": {
+      "name": "Development",
+      "url": "https://yourorg-dev.crm.dynamics.com"
+    },
+    "test": {
+      "name": "Test",
+      "url": "https://yourorg-test.crm.dynamics.com"
+    },
+    "prod": {
+      "name": "Production",
+      "url": "https://yourorg-prod.crm.dynamics.com"
+    }
+  },
+  
+  "comparison_settings": {
+    "default_output_directory": "./reports",
+    "include_system_fields": false,
+    "auto_open_excel": true
+  },
+  
+  "tables_to_monitor": [
+    "contact",
+    "account",
+    "mash_customtable"
+  ]
+}

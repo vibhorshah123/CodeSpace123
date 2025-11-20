@@ -1,0 +1,75 @@
+================================================================================
+  D365 Python Comparison Tool - START HERE
+================================================================================
+
+Welcome! This tool helps you compare Dynamics 365 environments.
+
+QUICK START (3 Easy Steps):
+================================================================================
+
+Step 1: SETUP (First time only)
+   👉 Double-click: setup.bat
+   ⏱️  Takes ~1 minute to install dependencies
+
+Step 2: RUN THE TOOL
+   👉 Double-click: run.bat
+   💡 Follow the on-screen prompts
+
+Step 3: ENJOY!
+   ✅ Compare schemas
+   📊 Generate Excel reports
+   🎯 Identify differences between environments
+
+================================================================================
+
+AVAILABLE FILES:
+================================================================================
+
+📄 setup.bat          - Run this FIRST to install Python packages
+📄 run.bat            - Run this to START the comparison tool
+📄 build_exe.bat      - Optional: Build standalone .exe (no Python needed)
+
+📖 QUICKSTART.md      - Quick start guide with examples
+📖 README.md          - Complete documentation
+📖 BUILD_EXE_GUIDE.md - How to build standalone executable
+
+================================================================================
+
+NEED HELP?
+================================================================================
+
+1. Read QUICKSTART.md for step-by-step instructions
+2. Read README.md for complete documentation
+3. Check troubleshooting section in QUICKSTART.md
+
+================================================================================
+
+REQUIREMENTS:
+================================================================================
+
+✓ Windows 7 or later
+✓ Python 3.8 or higher (download from python.org)
+✓ Internet connection
+✓ Valid Dynamics 365 credentials
+
+================================================================================
+
+WHAT THIS TOOL DOES:
+================================================================================
+
+✓ Compares table schemas between two D365 environments
+✓ Identifies fields only in source or target
+✓ Shows property differences (type, length, required level, etc.)
+✓ Generates Excel reports for easy analysis
+✓ Supports multiple authentication methods
+
+Coming Soon:
+  - Data comparison
+  - Flow comparison
+  - Batch operations
+
+================================================================================
+
+Ready to start? Double-click setup.bat now!
+
+================================================================================
