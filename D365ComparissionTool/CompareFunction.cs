@@ -89,6 +89,8 @@ public class DiffReport
     public Dictionary<string, ChildDiffReport> ChildDiffs { get; set; } = new();
     public bool SourceAuthFailed { get; set; } // indicates 401 while fetching source
     public bool TargetAuthFailed { get; set; } // indicates 401 while fetching target
+    // Added: primary name attribute for entity (used to output RecordName column consistently in Excel sheets)
+    public string? PrimaryNameAttribute { get; set; }
 }
 
 public class ChildMismatchDetail
@@ -292,6 +294,17 @@ public class ConfigurationComparisionFunction
         _logger.LogInformation("[{CorrelationId}] Field discovery SourceCount={SourceCount} TargetCount={TargetCount}", correlationId, sourceFields.Count, targetFields.Count);
         var rawIntersection = sourceFields.Intersect(targetFields, StringComparer.OrdinalIgnoreCase).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
 
+        // Discover primary name attribute (for consistent RecordName column). Use source environment metadata.
+        var primaryNameAttribute = await GetPrimaryNameAttributeAsync(request.SourceEnvUrl, request.EntityLogicalName, sourceToken);
+        if (!string.IsNullOrWhiteSpace(primaryNameAttribute))
+        {
+            _logger.LogInformation("[{CorrelationId}] PrimaryNameAttribute resolved '{PrimaryNameAttribute}'", correlationId, primaryNameAttribute);
+        }
+        else
+        {
+            _logger.LogWarning("[{CorrelationId}] PrimaryNameAttribute not found for entity '{Entity}'", correlationId, request.EntityLogicalName);
+        }
+
         // Normalize: keep base fields; capture formatted name variants mapping
         var formattedVariants = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); // variant -> base
         var selectableFields = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -340,7 +353,7 @@ public class ConfigurationComparisionFunction
             _logger.LogInformation("[{CorrelationId}] Formatted variants mapped: {Map}", correlationId, string.Join(';', formattedVariants.Select(m => m.Key + "->" + m.Value)));
         }
 
-        var report = new DiffReport { ComparedFields = fieldsToCompare };
+        var report = new DiffReport { ComparedFields = fieldsToCompare, PrimaryNameAttribute = primaryNameAttribute };
         if (fieldsToCompare.Count == 0)
         {
             report.Notes = "No mash_ prefixed fields found in both environments for the specified entity.";
@@ -353,7 +366,7 @@ public class ConfigurationComparisionFunction
         List<Dictionary<string, object?>> targetRecords = new();
         try
         {
-            sourceRecords = await FetchAllRecordsAsync(_logger, request.SourceEnvUrl, request.EntityLogicalName, validatedFields, sourceToken, onlyActive: true, correlationId);
+            sourceRecords = await FetchAllRecordsAsync(_logger, request.SourceEnvUrl, request.EntityLogicalName, validatedFields, sourceToken, onlyActive: true, correlationId, primaryNameAttribute);
         }
         catch (UnauthorizedAccessException uex)
         {
@@ -363,7 +376,7 @@ public class ConfigurationComparisionFunction
         }
         try
         {
-            targetRecords = await FetchAllRecordsAsync(_logger, request.TargetEnvUrl, request.EntityLogicalName, validatedFields, targetToken, onlyActive: true, correlationId);
+            targetRecords = await FetchAllRecordsAsync(_logger, request.TargetEnvUrl, request.EntityLogicalName, validatedFields, targetToken, onlyActive: true, correlationId, primaryNameAttribute);
         }
         catch (UnauthorizedAccessException uex)
         {
@@ -469,17 +482,17 @@ public class ConfigurationComparisionFunction
                     _logger.LogDebug("[{CorrelationId}] Skipping subgrid relation ChildEntity={ChildEntity} - no child fields to compare", correlationId, rel.ChildEntityLogicalName);
                     continue;
                 }
-                       var childReport = new ChildDiffReport
-                       {
-                           ChildEntityLogicalName = rel.ChildEntityLogicalName,
-                           ParentLookupField = rel.ChildParentFieldLogicalName,
-                           ComparedChildFields = rel.ChildFields.Distinct(StringComparer.OrdinalIgnoreCase).ToList()
-                       };
-                       try
-                       {
-                           _logger.LogInformation("[{CorrelationId}] Fetching child records ChildEntity={ChildEntity} ParentField={ParentField}", correlationId, rel.ChildEntityLogicalName, rel.ChildParentFieldLogicalName);
-                           var sourceChildren = await FetchChildRecordsAsync(_logger, request.SourceEnvUrl, rel.ChildEntityLogicalName, rel.ChildParentFieldLogicalName, rel.ChildFields, sourceToken, rel.OnlyActiveChildren, correlationId);
-                           var targetChildren = await FetchChildRecordsAsync(_logger, request.TargetEnvUrl, rel.ChildEntityLogicalName, rel.ChildParentFieldLogicalName, rel.ChildFields, targetToken, rel.OnlyActiveChildren, correlationId);
+                var childReport = new ChildDiffReport
+                {
+                    ChildEntityLogicalName = rel.ChildEntityLogicalName,
+                    ParentLookupField = rel.ChildParentFieldLogicalName,
+                    ComparedChildFields = rel.ChildFields.Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+                };
+                try
+                {
+                    _logger.LogInformation("[{CorrelationId}] Fetching child records ChildEntity={ChildEntity} ParentField={ParentField}", correlationId, rel.ChildEntityLogicalName, rel.ChildParentFieldLogicalName);
+                    var sourceChildren = await FetchChildRecordsAsync(_logger, request.SourceEnvUrl, rel.ChildEntityLogicalName, rel.ChildParentFieldLogicalName, rel.ChildFields, sourceToken, rel.OnlyActiveChildren, correlationId);
+                    var targetChildren = await FetchChildRecordsAsync(_logger, request.TargetEnvUrl, rel.ChildEntityLogicalName, rel.ChildParentFieldLogicalName, rel.ChildFields, targetToken, rel.OnlyActiveChildren, correlationId);
                     childReport.TotalSourceChildRecords = sourceChildren.Count;
                     childReport.TotalTargetChildRecords = targetChildren.Count;
 
@@ -847,7 +860,7 @@ public class ConfigurationComparisionFunction
         return result.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
 
-    private static async Task<List<Dictionary<string, object?>>> FetchAllRecordsAsync(ILogger logger, string envUrl, string entityLogicalName, IEnumerable<string> fields, string accessToken, bool onlyActive, Guid correlationId)
+    private static async Task<List<Dictionary<string, object?>>> FetchAllRecordsAsync(ILogger logger, string envUrl, string entityLogicalName, IEnumerable<string> fields, string accessToken, bool onlyActive, Guid correlationId, string? primaryNameAttribute)
     {
         var client = new HttpClient();
         client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
@@ -856,6 +869,7 @@ public class ConfigurationComparisionFunction
 
         string pkField = entityLogicalName + "id";
         var selectFields = new List<string> { pkField };
+        if (!string.IsNullOrWhiteSpace(primaryNameAttribute)) selectFields.Add(primaryNameAttribute);
         selectFields.AddRange(fields);
         selectFields = selectFields.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase).Where(s => s.Length < 129).ToList();
         string entitySetName = entityLogicalName + "s"; // TODO: replace with real EntitySetName lookup if needed
@@ -1052,28 +1066,25 @@ public class ConfigurationComparisionFunction
 
         // Removed separate MultiFieldMismatches worksheet per request; individual field mismatches already captured above.
 
-        void WriteRecordList(string sheetName, List<Dictionary<string, object?>> records)
+        // Write OnlyInSource / OnlyInTarget sheets with just RecordId column as requested
+        void WriteRecordIdOnly(string sheetName, List<Dictionary<string, object?>> records)
         {
             var ws = wb.Worksheets.Add(sheetName);
-            var allCols = new List<string> { entityLogicalName + "id" };
-            allCols.AddRange(report.ComparedFields);
-            for (int c = 0; c < allCols.Count; c++) ws.Cell(1, c + 1).Value = allCols[c];
+            ws.Cell(1, 1).Value = "RecordId";
             int row = 2;
+            string pk = entityLogicalName + "id";
             foreach (var rec in records)
             {
-                for (int c = 0; c < allCols.Count; c++)
+                if (rec.TryGetValue(pk, out var idVal))
                 {
-                    rec.TryGetValue(allCols[c], out var val);
-                    var text = val?.ToString();
-                    if (text is string s && string.IsNullOrWhiteSpace(s)) text = null;
-                    ws.Cell(row, c + 1).Value = Truncate(text);
+                    ws.Cell(row, 1).Value = idVal?.ToString();
+                    row++;
                 }
-                row++;
             }
             ws.Columns().AdjustToContents();
         }
-        WriteRecordList("OnlyInSource", report.OnlyInSource);
-        WriteRecordList("OnlyInTarget", report.OnlyInTarget);
+        WriteRecordIdOnly("OnlyInSource", report.OnlyInSource);
+        WriteRecordIdOnly("OnlyInTarget", report.OnlyInTarget);
 
         // Child diffs (unchanged)
         foreach (var child in report.ChildDiffs.Values)
@@ -1350,7 +1361,7 @@ public class ConfigurationComparisionFunction
     }
 
     // Cache for entity set names to avoid repeated metadata calls
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string,string> _entitySetNameCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _entitySetNameCache = new(StringComparer.OrdinalIgnoreCase);
 
     private static async Task<string?> GetEntitySetNameAsync(string envUrl, string logicalName, string accessToken)
     {
@@ -1372,6 +1383,36 @@ public class ConfigurationComparisionFunction
                 if (!string.IsNullOrWhiteSpace(val))
                 {
                     _entitySetNameCache[logicalName] = val;
+                    return val;
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // Retrieve primary name attribute for entity (cached)
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _primaryNameAttributeCache = new(StringComparer.OrdinalIgnoreCase);
+    private static async Task<string?> GetPrimaryNameAttributeAsync(string envUrl, string logicalName, string accessToken)
+    {
+        if (string.IsNullOrWhiteSpace(logicalName)) return null;
+        if (_primaryNameAttributeCache.TryGetValue(logicalName, out var cached)) return cached;
+        try
+        {
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+            client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
+            var url = envUrl.TrimEnd('/') + $"/api/data/v9.2/EntityDefinitions(LogicalName='{logicalName}')?$select=PrimaryNameAttribute";
+            using var resp = await client.GetAsync(url);
+            if (!resp.IsSuccessStatusCode) return null;
+            using var stream = await resp.Content.ReadAsStreamAsync();
+            using var doc = await JsonDocument.ParseAsync(stream);
+            if (doc.RootElement.TryGetProperty("PrimaryNameAttribute", out var pna))
+            {
+                var val = pna.GetString();
+                if (!string.IsNullOrWhiteSpace(val))
+                {
+                    _primaryNameAttributeCache[logicalName] = val;
                     return val;
                 }
             }
