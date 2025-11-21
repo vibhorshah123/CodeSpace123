@@ -5,7 +5,7 @@ Compares table schemas between two Dynamics 365 environments
 
 import requests
 from typing import Dict, List, Any
-from auth_manager import AuthManager
+from src.auth_manager import AuthManager
 
 
 class SchemaComparison:

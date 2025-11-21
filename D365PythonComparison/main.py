@@ -6,10 +6,10 @@ Main entry point for comparing Dynamics 365 table schemas between environments.
 import sys
 import getpass
 from typing import Dict, Any
-from auth_manager import AuthManager
-from schema_comparison import SchemaComparison
-from data_comparison import DataComparison
-from excel_generator import ExcelGenerator
+from src.auth_manager import AuthManager
+from src.schema_comparison import SchemaComparison
+from src.data_comparison import DataComparison
+from src.excel_generator import ExcelGenerator
 
 
 def print_banner():

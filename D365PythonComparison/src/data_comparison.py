@@ -6,7 +6,7 @@ Includes support for related records (subgrids) with One-To-Many, Many-To-One, a
 
 import requests
 from typing import Dict, List, Any, Optional, Tuple
-from auth_manager import AuthManager
+from src.auth_manager import AuthManager
 
 
 class DataComparison:
