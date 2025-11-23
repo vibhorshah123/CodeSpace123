@@ -729,3 +729,325 @@ class ExcelGenerator:
                     ws.cell(row=row, column=col).border = self.border
         
         self._auto_adjust_columns(ws)
+    
+    def generate_flow_comparison_report(self, comparison_result: Dict[str, Any], output_file: str, source_env_name: str = None, target_env_name: str = None):
+        """
+        Generate Excel report for flow comparison
+        
+        Args:
+            comparison_result: Dictionary containing comparison results
+            output_file: Output Excel file path
+            source_env_name: Name of source environment (optional)
+            target_env_name: Name of target environment (optional)
+        """
+        wb = openpyxl.Workbook()
+        
+        # Remove default sheet
+        if "Sheet" in wb.sheetnames:
+            wb.remove(wb["Sheet"])
+        
+        # Create Summary sheet
+        self._create_flow_summary_sheet(wb, comparison_result, source_env_name, target_env_name)
+        
+        # Create Identical Flows sheet
+        if comparison_result.get('identical_flows'):
+            self._create_identical_flows_sheet(wb, comparison_result)
+        
+        # Create Different Flows sheet
+        if comparison_result.get('non_identical_flows'):
+            self._create_different_flows_sheet(wb, comparison_result, source_env_name, target_env_name)
+        
+        # Create Missing in Target sheet
+        if comparison_result.get('missing_in_target'):
+            self._create_missing_flows_sheet(wb, comparison_result, target_env_name)
+        
+        # Create Errors sheet
+        if comparison_result.get('errors'):
+            self._create_flow_errors_sheet(wb, comparison_result)
+        
+        # Save workbook
+        wb.save(output_file)
+        print(f"  Excel report saved to: {output_file}")
+    
+    def _create_flow_summary_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
+        """Create flow comparison summary sheet"""
+        ws = wb.create_sheet("Summary", 0)
+        
+        # Title
+        ws['A1'] = "Flow Comparison Report"
+        ws['A1'].font = Font(bold=True, size=16)
+        ws.merge_cells('A1:B1')
+        
+        # Metadata
+        row = 3
+        source_label = source_env_name if source_env_name else "Source Environment"
+        ws[f'A{row}'] = f"{source_label}:"
+        ws[f'B{row}'] = comparison_result['source_url']
+        ws[f'A{row}'].font = Font(bold=True)
+        
+        row += 1
+        target_label = target_env_name if target_env_name else "Target Environment"
+        ws[f'A{row}'] = f"{target_label}:"
+        ws[f'B{row}'] = comparison_result['target_url']
+        ws[f'A{row}'].font = Font(bold=True)
+        
+        row += 1
+        ws[f'A{row}'] = "Report Generated:"
+        ws[f'B{row}'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws[f'A{row}'].font = Font(bold=True)
+        
+        # Summary statistics
+        row += 2
+        ws[f'A{row}'] = "COMPARISON SUMMARY"
+        ws[f'A{row}'].font = Font(bold=True, size=12)
+        ws.merge_cells(f'A{row}:B{row}')
+        
+        row += 1
+        ws[f'A{row}'] = "Metric"
+        ws[f'B{row}'] = "Count"
+        self._apply_header_style(ws, row, 2)
+        
+        # Statistics rows
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
+        stats = [
+            (f"{source_label} Flows (Total)", comparison_result['source_count'], None),
+            (f"{target_label} Flows (Total)", comparison_result['target_count'], None),
+            ("Identical Flows", len(comparison_result.get('identical_flows', [])), self.success_fill),
+            ("Different Flows", len(comparison_result.get('non_identical_flows', [])), self.warning_fill),
+            (f"Missing in {target_label}", comparison_result['missing_in_target_count'], self.warning_fill),
+            ("Flows with Errors", comparison_result['error_count'], self.warning_fill)
+        ]
+        
+        for label, value, fill in stats:
+            row += 1
+            ws[f'A{row}'] = label
+            ws[f'B{row}'] = value
+            ws[f'A{row}'].border = self.border
+            ws[f'B{row}'].border = self.border
+            if fill:
+                ws[f'B{row}'].fill = fill
+            ws[f'B{row}'].alignment = Alignment(horizontal='center')
+        
+        self._auto_adjust_columns(ws)
+    
+    def _create_identical_flows_sheet(self, wb, comparison_result: Dict[str, Any]):
+        """Create sheet for identical flows"""
+        ws = wb.create_sheet("Identical Flows")
+        
+        # Title
+        ws['A1'] = "Flows with Identical Definitions"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws.merge_cells('A1:B1')
+        
+        # Headers
+        ws['A3'] = "Flow Name"
+        ws['A3'].fill = self.success_fill
+        ws['A3'].font = Font(bold=True)
+        ws['A3'].border = self.border
+        
+        # Data
+        for idx, flow_name in enumerate(comparison_result['identical_flows'], start=4):
+            ws[f'A{idx}'] = flow_name
+            ws[f'A{idx}'].border = self.border
+            ws[f'A{idx}'].fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
+        
+        self._auto_adjust_columns(ws)
+    
+    def _create_different_flows_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
+        """Create sheet for flows with differences"""
+        ws = wb.create_sheet("Different Flows")
+        
+        # Title
+        ws['A1'] = "Flows with Different Definitions"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws.merge_cells('A1:F1')
+        
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
+        
+        # Headers
+        row = 3
+        headers = ["Flow Name", f"{source_label} Hash", f"{target_label} Hash", "Added Paths", "Removed Paths", "Changed Paths"]
+        for col, header in enumerate(headers, start=1):
+            cell = ws.cell(row=row, column=col)
+            cell.value = header
+        
+        self._apply_header_style(ws, row, len(headers))
+        
+        # Data
+        for comparison in comparison_result['comparisons']:
+            if comparison['status'] != 'different':
+                continue
+            
+            row += 1
+            ws[f'A{row}'] = comparison['name']
+            ws[f'B{row}'] = comparison['source']['hash'][:16] + "..." if comparison['source']['hash'] else ""
+            ws[f'C{row}'] = comparison['target']['hash'][:16] + "..." if comparison['target']['hash'] else ""
+            
+            # Diff details
+            if comparison.get('diff'):
+                ws[f'D{row}'] = len(comparison['diff']['added'])
+                ws[f'E{row}'] = len(comparison['diff']['removed'])
+                ws[f'F{row}'] = len(comparison['diff']['changed'])
+            else:
+                ws[f'D{row}'] = "N/A"
+                ws[f'E{row}'] = "N/A"
+                ws[f'F{row}'] = "N/A"
+            
+            # Apply borders and highlighting
+            for col in range(1, 7):
+                cell = ws.cell(row=row, column=col)
+                cell.border = self.border
+            
+            ws[f'D{row}'].fill = self.info_fill
+            ws[f'E{row}'].fill = self.info_fill
+            ws[f'F{row}'].fill = self.warning_fill
+        
+        self._auto_adjust_columns(ws)
+        
+        # Create detailed action differences sheet
+        self._create_action_differences_sheet(wb, comparison_result, source_env_name, target_env_name)
+    
+    def _create_action_differences_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
+        """Create sheet for action-level differences"""
+        ws = wb.create_sheet("Action Differences")
+        
+        # Title
+        ws['A1'] = "Flow Action-Level Differences"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws.merge_cells('A1:E1')
+        
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
+        
+        # Headers
+        row = 3
+        headers = ["Flow Name", "Action Name", "Status", "Property Path", f"{source_label} Value", f"{target_label} Value"]
+        for col, header in enumerate(headers, start=1):
+            cell = ws.cell(row=row, column=col)
+            cell.value = header
+        
+        self._apply_header_style(ws, row, len(headers))
+        
+        # Data
+        for comparison in comparison_result['comparisons']:
+            if not comparison.get('action_differences'):
+                continue
+            
+            for action_diff in comparison['action_differences']:
+                action_name = action_diff['action_name']
+                status = action_diff['status']
+                
+                if status in ['added', 'removed']:
+                    # Simple row for added/removed actions
+                    row += 1
+                    ws[f'A{row}'] = comparison['name']
+                    ws[f'B{row}'] = action_name
+                    ws[f'C{row}'] = status.upper()
+                    ws[f'D{row}'] = ""
+                    ws[f'E{row}'] = "(removed)" if status == 'removed' else ""
+                    ws[f'F{row}'] = "(added)" if status == 'added' else ""
+                    
+                    for col in range(1, 7):
+                        cell = ws.cell(row=row, column=col)
+                        cell.border = self.border
+                        if col in [2, 3]:
+                            cell.fill = self.warning_fill
+                else:
+                    # Changed action - show each property change
+                    for prop_change in action_diff['changed_properties']:
+                        row += 1
+                        ws[f'A{row}'] = comparison['name']
+                        ws[f'B{row}'] = action_name
+                        ws[f'C{row}'] = "CHANGED"
+                        ws[f'D{row}'] = prop_change['path']
+                        
+                        source_val = prop_change['source_value']
+                        target_val = prop_change['target_value']
+                        
+                        # Truncate long values
+                        if isinstance(source_val, str) and len(source_val) > 200:
+                            source_val = source_val[:200] + "..."
+                        if isinstance(target_val, str) and len(target_val) > 200:
+                            target_val = target_val[:200] + "..."
+                        
+                        ws[f'E{row}'] = str(source_val)
+                        ws[f'F{row}'] = str(target_val)
+                        
+                        for col in range(1, 7):
+                            cell = ws.cell(row=row, column=col)
+                            cell.border = self.border
+                        
+                        ws[f'E{row}'].fill = self.info_fill
+                        ws[f'F{row}'].fill = self.info_fill
+        
+        self._auto_adjust_columns(ws)
+    
+    def _create_missing_flows_sheet(self, wb, comparison_result: Dict[str, Any], target_env_name: str = None):
+        """Create sheet for flows missing in target"""
+        ws = wb.create_sheet("Missing in Target")
+        
+        target_label = target_env_name if target_env_name else "Target"
+        
+        # Title
+        ws['A1'] = f"Flows Missing in {target_label}"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws.merge_cells('A1:C1')
+        
+        # Headers
+        ws['A3'] = "Flow Name"
+        ws['B3'] = "Flow ID"
+        ws['C3'] = "Status"
+        self._apply_header_style(ws, 3, 3)
+        
+        # Data
+        row = 4
+        for comparison in comparison_result['comparisons']:
+            if comparison['status'] == 'missing_in_target':
+                ws[f'A{row}'] = comparison['name']
+                ws[f'B{row}'] = comparison['source']['flow_id']
+                ws[f'C{row}'] = "Missing in Target"
+                
+                for col in range(1, 4):
+                    cell = ws.cell(row=row, column=col)
+                    cell.border = self.border
+                    cell.fill = self.warning_fill
+                
+                row += 1
+        
+        self._auto_adjust_columns(ws)
+    
+    def _create_flow_errors_sheet(self, wb, comparison_result: Dict[str, Any]):
+        """Create sheet for flows with errors"""
+        ws = wb.create_sheet("Errors")
+        
+        # Title
+        ws['A1'] = "Flows with Processing Errors"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws.merge_cells('A1:D1')
+        
+        # Headers
+        ws['A3'] = "Flow Name"
+        ws['B3'] = "Source Error"
+        ws['C3'] = "Target Error"
+        ws['D3'] = "Status"
+        self._apply_header_style(ws, 3, 4)
+        
+        # Data
+        row = 4
+        for comparison in comparison_result['comparisons']:
+            if comparison['status'] == 'error':
+                ws[f'A{row}'] = comparison['name']
+                ws[f'B{row}'] = comparison['source'].get('error', '') if comparison['source'] else ''
+                ws[f'C{row}'] = comparison['target'].get('error', '') if comparison['target'] else ''
+                ws[f'D{row}'] = "Error"
+                
+                for col in range(1, 5):
+                    cell = ws.cell(row=row, column=col)
+                    cell.border = self.border
+                    cell.fill = self.warning_fill
+                
+                row += 1
+        
+        self._auto_adjust_columns(ws)

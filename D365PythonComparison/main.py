@@ -10,6 +10,7 @@ from datetime import datetime
 from src.auth_manager import AuthManager
 from src.schema_comparison import SchemaComparison
 from src.data_comparison import DataComparison
+from src.flow_comparison import FlowComparison
 from src.excel_generator import ExcelGenerator
 
 
@@ -90,7 +91,7 @@ def display_menu() -> str:
     print("-" * 70)
     print("1. Schema Comparison (Compare table structures)")
     print("2. Data Comparison (Compare records + relationships)")
-    print("3. Flow Comparison (Coming soon)")
+    print("3. Flow Comparison (Compare Power Automate flows)")
     print("0. Exit")
     print("-" * 70)
     
@@ -283,6 +284,114 @@ def run_data_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
         traceback.print_exc()
 
 
+def run_flow_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
+    """
+    Execute flow comparison between two environments
+    
+    Args:
+        auth_manager: Authentication manager instance
+        envs: Dictionary containing source and target environment URLs
+    """
+    print("\n" + "=" * 70)
+    print(" " * 20 + "Flow Comparison")
+    print("=" * 70)
+    
+    # Ask if comparing specific flow or all flows
+    print("\nComparison Options:")
+    print("  1. Compare all flows")
+    print("  2. Compare specific flow by name")
+    
+    choice = input("\nSelect option [1-2]: ").strip()
+    
+    flow_name = None
+    if choice == "2":
+        flow_name = input("\nEnter flow name: ").strip()
+        if not flow_name:
+            print("Error: Flow name cannot be empty!")
+            return
+    
+    print(f"\nComparing flows between environments...")
+    if flow_name:
+        print(f"  Flow: {flow_name}")
+    else:
+        print(f"  Mode: All flows")
+    
+    try:
+        # Initialize flow comparison
+        comparison = FlowComparison(auth_manager)
+        
+        # Perform comparison
+        result = comparison.compare_flows(
+            envs["source_url"],
+            envs["target_url"],
+            flow_name=flow_name,
+            include_diff_details=True
+        )
+        
+        # Display summary
+        print("\n" + "-" * 70)
+        print("COMPARISON SUMMARY")
+        print("-" * 70)
+        print(f"Source Environment: {envs['source_url']}")
+        print(f"Target Environment: {envs['target_url']}")
+        print()
+        print(f"Source flows: {result['source_count']}")
+        print(f"Target flows: {result['target_count']}")
+        print(f"Identical flows: {len(result['identical_flows'])}")
+        print(f"Different flows: {len(result['non_identical_flows'])}")
+        print(f"Missing in Target: {result['missing_in_target_count']}")
+        print(f"Flows with errors: {result['error_count']}")
+        print("-" * 70)
+        
+        # Show some details
+        if result['identical_flows']:
+            print(f"\nIdentical Flows ({len(result['identical_flows'])}):")
+            for flow in result['identical_flows'][:5]:
+                print(f"  ✓ {flow}")
+            if len(result['identical_flows']) > 5:
+                print(f"  ... and {len(result['identical_flows']) - 5} more")
+        
+        if result['non_identical_flows']:
+            print(f"\nDifferent Flows ({len(result['non_identical_flows'])}):")
+            for flow in result['non_identical_flows'][:5]:
+                print(f"  ⚠ {flow}")
+            if len(result['non_identical_flows']) > 5:
+                print(f"  ... and {len(result['non_identical_flows']) - 5} more")
+        
+        if result['missing_in_target']:
+            print(f"\nMissing in Target ({result['missing_in_target_count']}):")
+            for flow in result['missing_in_target'][:5]:
+                print(f"  ✗ {flow}")
+            if result['missing_in_target_count'] > 5:
+                print(f"  ... and {result['missing_in_target_count'] - 5} more")
+        
+        # Generate Excel
+        print("\n" + "-" * 70)
+        generate_excel = input("Generate Excel report? (y/n): ").strip().lower()
+        
+        if generate_excel == 'y':
+            # Auto-generate filename: flow_comparison_{flowname}_{datenow}.xlsx
+            date_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if flow_name:
+                safe_name = flow_name.replace(" ", "_").replace("/", "_")
+                output_file = f"flow_comparison_{safe_name}_{date_now}.xlsx"
+            else:
+                output_file = f"flow_comparison_all_{date_now}.xlsx"
+            
+            # Extract environment names from URLs
+            source_env_name = envs["source_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+            target_env_name = envs["target_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+            
+            generator = ExcelGenerator()
+            generator.generate_flow_comparison_report(result, output_file, source_env_name, target_env_name)
+            print(f"\n✓ Excel report generated: {output_file}")
+        
+    except Exception as e:
+        print(f"\nError during flow comparison: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
 def main():
     """Main application entry point"""
     print_banner()
@@ -314,7 +423,7 @@ def main():
         elif choice == "2":
             run_data_comparison(auth_manager, envs)
         elif choice == "3":
-            print("\nFlow Comparison - Coming Soon!")
+            run_flow_comparison(auth_manager, envs)
         else:
             print("\nInvalid choice! Please try again.")
         
