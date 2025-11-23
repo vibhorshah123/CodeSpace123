@@ -1051,3 +1051,294 @@ class ExcelGenerator:
                 row += 1
         
         self._auto_adjust_columns(ws)
+    
+    def generate_solution_comparison_report(self, comparison_result: Dict[str, Any], output_file: str, source_env_name: str = None, target_env_name: str = None):
+        """
+        Generate Excel report for solution comparison
+        
+        Args:
+            comparison_result: Dictionary containing comparison results
+            output_file: Output Excel file path
+            source_env_name: Name of source environment (optional)
+            target_env_name: Name of target environment (optional)
+        """
+        wb = openpyxl.Workbook()
+        
+        # Remove default sheet
+        if "Sheet" in wb.sheetnames:
+            wb.remove(wb["Sheet"])
+        
+        # Create Summary sheet
+        self._create_solution_summary_sheet(wb, comparison_result, source_env_name, target_env_name)
+        
+        # Create Component Type Summary sheet
+        self._create_component_type_summary_sheet(wb, comparison_result, source_env_name, target_env_name)
+        
+        # Create Components Only in Source sheet
+        if comparison_result.get('only_in_source'):
+            self._create_components_only_in_source_sheet(wb, comparison_result, source_env_name)
+        
+        # Create Components Only in Target sheet
+        if comparison_result.get('only_in_target'):
+            self._create_components_only_in_target_sheet(wb, comparison_result, target_env_name)
+        
+        # Create Common Components sheet
+        if comparison_result.get('common_components'):
+            self._create_common_components_sheet(wb, comparison_result)
+        
+        # Save workbook
+        wb.save(output_file)
+        print(f"  Excel report saved to: {output_file}")
+    
+    def _create_solution_summary_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
+        """Create solution comparison summary sheet"""
+        ws = wb.create_sheet("Summary", 0)
+        
+        # Title
+        ws['A1'] = "Solution Comparison Report"
+        ws['A1'].font = Font(bold=True, size=16)
+        ws.merge_cells('A1:B1')
+        
+        # Metadata
+        row = 3
+        ws[f'A{row}'] = "Solution Name:"
+        ws[f'B{row}'] = comparison_result['solution_name']
+        ws[f'A{row}'].font = Font(bold=True)
+        
+        row += 1
+        source_label = source_env_name if source_env_name else "Source Environment"
+        ws[f'A{row}'] = f"{source_label}:"
+        ws[f'B{row}'] = comparison_result['source_url']
+        ws[f'A{row}'].font = Font(bold=True)
+        
+        row += 1
+        target_label = target_env_name if target_env_name else "Target Environment"
+        ws[f'A{row}'] = f"{target_label}:"
+        ws[f'B{row}'] = comparison_result['target_url']
+        ws[f'A{row}'].font = Font(bold=True)
+        
+        row += 1
+        ws[f'A{row}'] = "Report Generated:"
+        ws[f'B{row}'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws[f'A{row}'].font = Font(bold=True)
+        
+        # Solution details
+        if comparison_result.get('source_solution'):
+            row += 2
+            ws[f'A{row}'] = f"{source_label} Solution Details"
+            ws[f'A{row}'].font = Font(bold=True, size=12)
+            ws.merge_cells(f'A{row}:B{row}')
+            
+            source_sol = comparison_result['source_solution']
+            row += 1
+            ws[f'A{row}'] = "Version:"
+            ws[f'B{row}'] = source_sol.get('version', 'N/A')
+            
+            row += 1
+            ws[f'A{row}'] = "Is Managed:"
+            ws[f'B{row}'] = "Yes" if source_sol.get('ismanaged') else "No"
+            
+            row += 1
+            ws[f'A{row}'] = "Friendly Name:"
+            ws[f'B{row}'] = source_sol.get('friendlyname', 'N/A')
+        
+        if comparison_result.get('target_solution'):
+            row += 2
+            ws[f'A{row}'] = f"{target_label} Solution Details"
+            ws[f'A{row}'].font = Font(bold=True, size=12)
+            ws.merge_cells(f'A{row}:B{row}')
+            
+            target_sol = comparison_result['target_solution']
+            row += 1
+            ws[f'A{row}'] = "Version:"
+            ws[f'B{row}'] = target_sol.get('version', 'N/A')
+            
+            row += 1
+            ws[f'A{row}'] = "Is Managed:"
+            ws[f'B{row}'] = "Yes" if target_sol.get('ismanaged') else "No"
+            
+            row += 1
+            ws[f'A{row}'] = "Friendly Name:"
+            ws[f'B{row}'] = target_sol.get('friendlyname', 'N/A')
+        
+        # Summary statistics
+        row += 2
+        ws[f'A{row}'] = "COMPARISON SUMMARY"
+        ws[f'A{row}'].font = Font(bold=True, size=12)
+        ws.merge_cells(f'A{row}:B{row}')
+        
+        row += 1
+        ws[f'A{row}'] = "Metric"
+        ws[f'B{row}'] = "Count"
+        self._apply_header_style(ws, row, 2)
+        
+        # Statistics rows
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
+        stats = [
+            (f"{source_label} Components (Total)", comparison_result['source_component_count'], None),
+            (f"{target_label} Components (Total)", comparison_result['target_component_count'], None),
+            (f"Components Only in {source_label}", comparison_result['source_only_count'], self.warning_fill),
+            (f"Components Only in {target_label}", comparison_result['target_only_count'], self.warning_fill),
+            ("Common Components", comparison_result['common_count'], self.success_fill)
+        ]
+        
+        for label, value, fill in stats:
+            row += 1
+            ws[f'A{row}'] = label
+            ws[f'B{row}'] = value
+            ws[f'A{row}'].border = self.border
+            ws[f'B{row}'].border = self.border
+            if fill:
+                ws[f'B{row}'].fill = fill
+            ws[f'B{row}'].alignment = Alignment(horizontal='center')
+        
+        self._auto_adjust_columns(ws)
+    
+    def _create_component_type_summary_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
+        """Create component type summary sheet"""
+        ws = wb.create_sheet("Component Type Summary")
+        
+        # Title
+        ws['A1'] = "Solution Components by Type"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws.merge_cells('A1:F1')
+        
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
+        
+        # Headers
+        row = 3
+        headers = ["Component Type", f"{source_label} Count", f"{target_label} Count", "Common", f"Only in {source_label}", f"Only in {target_label}"]
+        for col, header in enumerate(headers, start=1):
+            cell = ws.cell(row=row, column=col)
+            cell.value = header
+        
+        self._apply_header_style(ws, row, len(headers))
+        
+        # Data - sort by component type name
+        component_summary = comparison_result.get('component_summary', {})
+        for comp_type in sorted(component_summary.keys()):
+            stats = component_summary[comp_type]
+            row += 1
+            ws[f'A{row}'] = comp_type
+            ws[f'B{row}'] = stats['source']
+            ws[f'C{row}'] = stats['target']
+            ws[f'D{row}'] = stats['common']
+            ws[f'E{row}'] = stats['source_only']
+            ws[f'F{row}'] = stats['target_only']
+            
+            for col in range(1, 7):
+                cell = ws.cell(row=row, column=col)
+                cell.border = self.border
+            
+            # Highlight differences
+            if stats['source_only'] > 0:
+                ws[f'E{row}'].fill = self.warning_fill
+            if stats['target_only'] > 0:
+                ws[f'F{row}'].fill = self.warning_fill
+            if stats['common'] > 0:
+                ws[f'D{row}'].fill = self.success_fill
+        
+        self._auto_adjust_columns(ws)
+    
+    def _create_components_only_in_source_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None):
+        """Create sheet for components only in source"""
+        source_label = source_env_name if source_env_name else "Source"
+        ws = wb.create_sheet(f"Only in {source_label}")
+        
+        # Title
+        ws['A1'] = f"Components Only in {source_label}"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws.merge_cells('A1:C1')
+        
+        # Headers
+        ws['A3'] = "Component Type"
+        ws['B3'] = "Object ID"
+        ws['C3'] = "Root Behavior"
+        self._apply_header_style(ws, 3, 3)
+        
+        # Data - sort by component type
+        components = sorted(comparison_result['only_in_source'], key=lambda x: x['componenttype_name'])
+        
+        row = 4
+        for comp in components:
+            ws[f'A{row}'] = comp['componenttype_name']
+            ws[f'B{row}'] = comp['objectid']
+            ws[f'C{row}'] = str(comp.get('rootcomponentbehavior', 'N/A'))
+            
+            for col in range(1, 4):
+                cell = ws.cell(row=row, column=col)
+                cell.border = self.border
+                cell.fill = self.warning_fill
+            
+            row += 1
+        
+        self._auto_adjust_columns(ws)
+    
+    def _create_components_only_in_target_sheet(self, wb, comparison_result: Dict[str, Any], target_env_name: str = None):
+        """Create sheet for components only in target"""
+        target_label = target_env_name if target_env_name else "Target"
+        ws = wb.create_sheet(f"Only in {target_label}")
+        
+        # Title
+        ws['A1'] = f"Components Only in {target_label}"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws.merge_cells('A1:C1')
+        
+        # Headers
+        ws['A3'] = "Component Type"
+        ws['B3'] = "Object ID"
+        ws['C3'] = "Root Behavior"
+        self._apply_header_style(ws, 3, 3)
+        
+        # Data - sort by component type
+        components = sorted(comparison_result['only_in_target'], key=lambda x: x['componenttype_name'])
+        
+        row = 4
+        for comp in components:
+            ws[f'A{row}'] = comp['componenttype_name']
+            ws[f'B{row}'] = comp['objectid']
+            ws[f'C{row}'] = str(comp.get('rootcomponentbehavior', 'N/A'))
+            
+            for col in range(1, 4):
+                cell = ws.cell(row=row, column=col)
+                cell.border = self.border
+                cell.fill = self.info_fill
+            
+            row += 1
+        
+        self._auto_adjust_columns(ws)
+    
+    def _create_common_components_sheet(self, wb, comparison_result: Dict[str, Any]):
+        """Create sheet for common components"""
+        ws = wb.create_sheet("Common Components")
+        
+        # Title
+        ws['A1'] = "Components Present in Both Environments"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws.merge_cells('A1:C1')
+        
+        # Headers
+        ws['A3'] = "Component Type"
+        ws['B3'] = "Object ID"
+        ws['C3'] = "Root Behavior"
+        self._apply_header_style(ws, 3, 3)
+        
+        # Data - sort by component type
+        components = sorted(comparison_result['common_components'], key=lambda x: x['componenttype_name'])
+        
+        row = 4
+        for comp in components:
+            ws[f'A{row}'] = comp['componenttype_name']
+            ws[f'B{row}'] = comp['objectid']
+            ws[f'C{row}'] = str(comp.get('rootcomponentbehavior', 'N/A'))
+            
+            for col in range(1, 4):
+                cell = ws.cell(row=row, column=col)
+                cell.border = self.border
+                cell.fill = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")
+            
+            row += 1
+        
+        self._auto_adjust_columns(ws)

@@ -15,10 +15,22 @@ A Python-based interactive command-line tool for comparing Dynamics 365 environm
   - Related records comparison (One-To-Many relationships/subgrids)
   - Automatic relationship discovery
   - Identifies records only in source, only in target, and mismatches
+- **Flow Comparison**: Compare Power Automate flows between environments
+  - Definition comparison with SHA256 hashing
+  - JSON normalization to exclude environment-specific details
+  - Action-level difference analysis
+  - Identifies identical, different, and missing flows
+- **Solution Comparison**: Compare solution components between environments
+  - All 160+ component types (entities, forms, workflows, web resources, etc.)
+  - Component-level granularity
+  - Identifies missing, extra, and common components
+  - Component type summary with breakdown
 - **Excel Report Generation**: Creates comprehensive Excel reports with multiple sheets:
   - Summary statistics
   - Detailed differences with color coding
   - Related entity comparisons with parent-child hierarchy
+  - Flow comparison with action-level diffs
+  - Solution component breakdown by type
 
 ## Prerequisites
 

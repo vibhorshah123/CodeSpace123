@@ -11,6 +11,7 @@ from src.auth_manager import AuthManager
 from src.schema_comparison import SchemaComparison
 from src.data_comparison import DataComparison
 from src.flow_comparison import FlowComparison
+from src.solution_comparison import SolutionComparison
 from src.excel_generator import ExcelGenerator
 
 
@@ -92,6 +93,7 @@ def display_menu() -> str:
     print("1. Schema Comparison (Compare table structures)")
     print("2. Data Comparison (Compare records + relationships)")
     print("3. Flow Comparison (Compare Power Automate flows)")
+    print("4. Solution Comparison (Compare solution components)")
     print("0. Exit")
     print("-" * 70)
     
@@ -378,6 +380,143 @@ def run_flow_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
         traceback.print_exc()
 
 
+def run_solution_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
+    """
+    Execute solution comparison between two environments
+    
+    Args:
+        auth_manager: Authentication manager instance
+        envs: Dictionary containing source and target environment URLs
+    """
+    print("\n" + "=" * 70)
+    print(" " * 20 + "Solution Comparison")
+    print("=" * 70)
+    
+    # Prompt for solution unique name
+    solution_name = input("\nEnter solution unique name (e.g., mysolution): ").strip()
+    
+    if not solution_name:
+        print("Error: Solution name cannot be empty!")
+        return
+    
+    print(f"\nComparing solution '{solution_name}' between environments...")
+    
+    try:
+        # Initialize solution comparison
+        comparison = SolutionComparison(auth_manager)
+        
+        # Perform comparison
+        result = comparison.compare_solutions(
+            envs["source_url"],
+            envs["target_url"],
+            solution_name
+        )
+        
+        # Check if solution was found
+        if result['status'] == 'missing_in_target':
+            print(f"\n⚠ Warning: Solution '{solution_name}' found in source but NOT in target environment!")
+            print(f"  Source components: {result['source_component_count']}")
+            
+            # Show component type summary
+            if result.get('component_summary'):
+                print("\n  Component breakdown:")
+                for comp_type, stats in sorted(result['component_summary'].items()):
+                    if stats['source'] > 0:
+                        print(f"    {comp_type}: {stats['source']}")
+            
+            # Ask if user wants to generate report anyway
+            print("\n" + "-" * 70)
+            generate_excel = input("Generate Excel report? (y/n): ").strip().lower()
+            
+            if generate_excel == 'y':
+                date_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_file = f"solution_comparison_{solution_name}_{date_now}.xlsx"
+                
+                source_env_name = envs["source_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+                target_env_name = envs["target_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+                
+                generator = ExcelGenerator()
+                generator.generate_solution_comparison_report(result, output_file, source_env_name, target_env_name)
+                print(f"\n✓ Excel report generated: {output_file}")
+            
+            return
+        
+        # Display summary
+        print("\n" + "-" * 70)
+        print("COMPARISON SUMMARY")
+        print("-" * 70)
+        print(f"Solution: {solution_name}")
+        print(f"Source Environment: {envs['source_url']}")
+        print(f"Target Environment: {envs['target_url']}")
+        print()
+        
+        # Solution details
+        if result.get('source_solution'):
+            source_sol = result['source_solution']
+            print(f"Source Version: {source_sol.get('version', 'N/A')}")
+            print(f"Source Is Managed: {'Yes' if source_sol.get('ismanaged') else 'No'}")
+        
+        if result.get('target_solution'):
+            target_sol = result['target_solution']
+            print(f"Target Version: {target_sol.get('version', 'N/A')}")
+            print(f"Target Is Managed: {'Yes' if target_sol.get('ismanaged') else 'No'}")
+        
+        print()
+        print(f"Source Components: {result['source_component_count']}")
+        print(f"Target Components: {result['target_component_count']}")
+        print(f"Common Components: {result['common_count']}")
+        print(f"Only in Source: {result['source_only_count']}")
+        print(f"Only in Target: {result['target_only_count']}")
+        print("-" * 70)
+        
+        # Show component type summary
+        if result.get('component_summary'):
+            print("\nComponent Type Summary:")
+            print("-" * 70)
+            print(f"{'Component Type':<30} {'Source':<10} {'Target':<10} {'Common':<10}")
+            print("-" * 70)
+            
+            for comp_type, stats in sorted(result['component_summary'].items()):
+                print(f"{comp_type:<30} {stats['source']:<10} {stats['target']:<10} {stats['common']:<10}")
+        
+        # Show differences
+        if result['source_only_count'] > 0:
+            print(f"\nComponents Only in Source ({result['source_only_count']}):")
+            only_in_source = result['only_in_source'][:10]
+            for comp in only_in_source:
+                print(f"  ⚠ {comp['componenttype_name']}: {comp['objectid']}")
+            if result['source_only_count'] > 10:
+                print(f"  ... and {result['source_only_count'] - 10} more")
+        
+        if result['target_only_count'] > 0:
+            print(f"\nComponents Only in Target ({result['target_only_count']}):")
+            only_in_target = result['only_in_target'][:10]
+            for comp in only_in_target:
+                print(f"  ℹ {comp['componenttype_name']}: {comp['objectid']}")
+            if result['target_only_count'] > 10:
+                print(f"  ... and {result['target_only_count'] - 10} more")
+        
+        # Generate Excel
+        print("\n" + "-" * 70)
+        generate_excel = input("Generate Excel report? (y/n): ").strip().lower()
+        
+        if generate_excel == 'y':
+            date_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"solution_comparison_{solution_name}_{date_now}.xlsx"
+            
+            source_env_name = envs["source_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+            target_env_name = envs["target_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+            
+            generator = ExcelGenerator()
+            generator.generate_solution_comparison_report(result, output_file, source_env_name, target_env_name)
+            print(f"\n✓ Excel report generated: {output_file}")
+        
+    except Exception as e:
+        print(f"\nError during solution comparison: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
 def main():
     """Main application entry point"""
     print_banner()
@@ -410,6 +549,8 @@ def main():
             run_data_comparison(auth_manager, envs)
         elif choice == "3":
             run_flow_comparison(auth_manager, envs)
+        elif choice == "4":
+            run_solution_comparison(auth_manager, envs)
         else:
             print("\nInvalid choice! Please try again.")
         

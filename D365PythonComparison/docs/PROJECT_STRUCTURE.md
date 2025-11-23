@@ -12,6 +12,8 @@ D365PythonComparison/
 │   ├── auth_manager.py           # OAuth 2.0 authentication with PKCE
 │   ├── schema_comparison.py      # Table metadata comparison
 │   ├── data_comparison.py        # Data record comparison with relationships
+│   ├── flow_comparison.py        # Power Automate flow comparison
+│   ├── solution_comparison.py    # Solution component comparison
 │   └── excel_generator.py        # Excel report generation
 │
 ├── docs/                         # Documentation
@@ -20,6 +22,8 @@ D365PythonComparison/
 │   ├── BUILD_EXE_GUIDE.md        # PyInstaller executable guide
 │   ├── DATA_COMPARISON_GUIDE.md  # Data comparison feature guide
 │   ├── FIELD_FILTERING_ENHANCEMENTS.md  # System field exclusion guide
+│   ├── FLOW_COMPARISON_GUIDE.md  # Flow comparison feature guide
+│   ├── SOLUTION_COMPARISON_GUIDE.md  # Solution comparison feature guide
 │   ├── START_HERE.txt            # Simple first-time user guide
 │   └── PROJECT_STRUCTURE.md      # This file
 │
@@ -40,12 +44,24 @@ D365PythonComparison/
 - **schema_comparison.py**: Compares table metadata (attributes, display names, types, required levels) between two D365 environments. Generates Excel reports with color-coded differences.
 
 - **data_comparison.py**: Compares actual data records between environments using GUID-based matching. Features:
-  - System field exclusion (33 fields including modifiedon, createdby, ownerid)
+  - System field exclusion (35 fields including modifiedon, createdby, ownerid, createdonbehalfby, modifiedonbehalfby)
   - One-To-Many relationship comparison (subgrids)
   - GUID mismatch detection for lookup fields
   - Primary name field matching
 
-- **excel_generator.py**: Creates formatted Excel workbooks with multiple sheets showing comparison results. Uses color coding and clear GUID-based terminology.
+- **flow_comparison.py**: Compares Power Automate flows between environments. Features:
+  - SHA256 hash-based comparison
+  - JSON normalization (removes environment-specific GUIDs, timestamps, connection references)
+  - Action-level difference analysis
+  - Identifies identical, different, and missing flows
+
+- **solution_comparison.py**: Compares solution components between environments. Features:
+  - Fetches all components for a solution
+  - Compares by (objectid, componenttype) tuple
+  - Maps 160+ component types to readable names
+  - Groups results by component type
+
+- **excel_generator.py**: Creates formatted Excel workbooks with multiple sheets showing comparison results. Uses color coding and clear GUID-based terminology. Supports schema, data, flow, and solution comparison reports.
 
 ### Documentation (docs/)
 - **README.md**: Comprehensive project documentation
