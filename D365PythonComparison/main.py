@@ -296,25 +296,14 @@ def run_flow_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
     print(" " * 20 + "Flow Comparison")
     print("=" * 70)
     
-    # Ask if comparing specific flow or all flows
-    print("\nComparison Options:")
-    print("  1. Compare all flows")
-    print("  2. Compare specific flow by name")
+    # Prompt for flow name
+    flow_name = input("\nEnter flow name to compare: ").strip()
     
-    choice = input("\nSelect option [1-2]: ").strip()
+    if not flow_name:
+        print("Error: Flow name cannot be empty!")
+        return
     
-    flow_name = None
-    if choice == "2":
-        flow_name = input("\nEnter flow name: ").strip()
-        if not flow_name:
-            print("Error: Flow name cannot be empty!")
-            return
-    
-    print(f"\nComparing flows between environments...")
-    if flow_name:
-        print(f"  Flow: {flow_name}")
-    else:
-        print(f"  Mode: All flows")
+    print(f"\nComparing flow '{flow_name}' between environments...")
     
     try:
         # Initialize flow comparison
@@ -372,11 +361,8 @@ def run_flow_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
         if generate_excel == 'y':
             # Auto-generate filename: flow_comparison_{flowname}_{datenow}.xlsx
             date_now = datetime.now().strftime("%Y%m%d_%H%M%S")
-            if flow_name:
-                safe_name = flow_name.replace(" ", "_").replace("/", "_")
-                output_file = f"flow_comparison_{safe_name}_{date_now}.xlsx"
-            else:
-                output_file = f"flow_comparison_all_{date_now}.xlsx"
+            safe_name = flow_name.replace(" ", "_").replace("/", "_")
+            output_file = f"flow_comparison_{safe_name}_{date_now}.xlsx"
             
             # Extract environment names from URLs
             source_env_name = envs["source_url"].replace("https://", "").replace(".crm.dynamics.com", "")
