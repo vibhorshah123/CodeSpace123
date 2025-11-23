@@ -6,6 +6,7 @@ Main entry point for comparing Dynamics 365 table schemas between environments.
 import sys
 import getpass
 from typing import Dict, Any
+from datetime import datetime
 from src.auth_manager import AuthManager
 from src.schema_comparison import SchemaComparison
 from src.data_comparison import DataComparison
@@ -166,12 +167,9 @@ def run_schema_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
         generate_excel = input("Generate Excel report? (y/n): ").strip().lower()
         
         if generate_excel == 'y':
-            output_file = input("Enter output filename (default: schema_comparison.xlsx): ").strip()
-            if not output_file:
-                output_file = "schema_comparison.xlsx"
-            
-            if not output_file.endswith('.xlsx'):
-                output_file += '.xlsx'
+            # Auto-generate filename: schema_comparison_{entityname}_{datenow}.xlsx
+            date_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"schema_comparison_{table_name}_{date_now}.xlsx"
             
             # Extract environment names from URLs
             source_env_name = envs["source_url"].replace("https://", "").replace(".crm.dynamics.com", "")
@@ -267,12 +265,9 @@ def run_data_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
         generate_excel = input("Generate Excel report? (y/n): ").strip().lower()
         
         if generate_excel == 'y':
-            output_file = input("Enter output filename (default: data_comparison.xlsx): ").strip()
-            if not output_file:
-                output_file = "data_comparison.xlsx"
-            
-            if not output_file.endswith('.xlsx'):
-                output_file += '.xlsx'
+            # Auto-generate filename: data_comparison_{entityname}_{datenow}.xlsx
+            date_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"data_comparison_{table_name}_{date_now}.xlsx"
             
             # Extract environment names from URLs
             source_env_name = envs["source_url"].replace("https://", "").replace(".crm.dynamics.com", "")
