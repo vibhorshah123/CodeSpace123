@@ -53,7 +53,7 @@ def get_credentials() -> Dict[str, str]:
 
 def get_environment_details() -> Dict[str, str]:
     """
-    Prompt user for environment URLs
+    Prompt user for environment names and construct URLs
     
     Returns:
         Dictionary containing environment URLs
@@ -61,10 +61,17 @@ def get_environment_details() -> Dict[str, str]:
     print("Enter environment details:")
     print("-" * 70)
     
-    env1_url = input("Source Environment URL (e.g., https://orgname.crm.dynamics.com): ").strip()
-    env2_url = input("Target Environment URL (e.g., https://orgname2.crm.dynamics.com): ").strip()
+    env1_name = input("Source Environment Name (e.g., mash, orgname): ").strip()
+    env2_name = input("Target Environment Name (e.g., mashvnext, orgname2): ").strip()
     
+    # Construct full URLs
+    env1_url = f"https://{env1_name}.crm.dynamics.com"
+    env2_url = f"https://{env2_name}.crm.dynamics.com"
+    
+    print(f"\nSource URL: {env1_url}")
+    print(f"Target URL: {env2_url}")
     print()
+    
     return {
         "source_url": env1_url,
         "target_url": env2_url
@@ -166,8 +173,12 @@ def run_schema_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
             if not output_file.endswith('.xlsx'):
                 output_file += '.xlsx'
             
+            # Extract environment names from URLs
+            source_env_name = envs["source_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+            target_env_name = envs["target_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+            
             generator = ExcelGenerator()
-            generator.generate_schema_comparison_report(result, table_name, output_file)
+            generator.generate_schema_comparison_report(result, table_name, output_file, source_env_name, target_env_name)
             print(f"\n✓ Excel report generated: {output_file}")
         
     except Exception as e:
@@ -263,8 +274,12 @@ def run_data_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
             if not output_file.endswith('.xlsx'):
                 output_file += '.xlsx'
             
+            # Extract environment names from URLs
+            source_env_name = envs["source_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+            target_env_name = envs["target_url"].replace("https://", "").replace(".crm.dynamics.com", "")
+            
             generator = ExcelGenerator()
-            generator.generate_data_comparison_report(result, table_name, output_file)
+            generator.generate_data_comparison_report(result, table_name, output_file, source_env_name, target_env_name)
             print(f"\n✓ Excel report generated: {output_file}")
         
     except Exception as e:

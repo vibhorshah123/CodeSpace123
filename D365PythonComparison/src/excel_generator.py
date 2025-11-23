@@ -52,7 +52,7 @@ class ExcelGenerator:
             adjusted_width = min(max_length + 2, 50)
             ws.column_dimensions[column_letter].width = adjusted_width
     
-    def generate_schema_comparison_report(self, comparison_result: Dict[str, Any], table_name: str, output_file: str):
+    def generate_schema_comparison_report(self, comparison_result: Dict[str, Any], table_name: str, output_file: str, source_env_name: str = None, target_env_name: str = None):
         """
         Generate Excel report for schema comparison
         
@@ -60,6 +60,8 @@ class ExcelGenerator:
             comparison_result: Dictionary containing comparison results
             table_name: Name of the table being compared
             output_file: Output Excel file path
+            source_env_name: Name of source environment (optional)
+            target_env_name: Name of target environment (optional)
         """
         wb = openpyxl.Workbook()
         
@@ -68,15 +70,15 @@ class ExcelGenerator:
             wb.remove(wb["Sheet"])
         
         # Create Summary sheet
-        self._create_summary_sheet(wb, comparison_result, table_name)
+        self._create_summary_sheet(wb, comparison_result, table_name, source_env_name, target_env_name)
         
         # Create Fields Only in Source sheet
         if comparison_result['only_in_source']:
-            self._create_only_in_source_sheet(wb, comparison_result)
+            self._create_only_in_source_sheet(wb, comparison_result, source_env_name)
         
         # Create Fields Only in Target sheet
         if comparison_result['only_in_target']:
-            self._create_only_in_target_sheet(wb, comparison_result)
+            self._create_only_in_target_sheet(wb, comparison_result, target_env_name)
         
         # Create Field Differences sheet
         if comparison_result['field_differences']:
@@ -90,7 +92,7 @@ class ExcelGenerator:
         wb.save(output_file)
         print(f"  Excel report saved to: {output_file}")
     
-    def _create_summary_sheet(self, wb, comparison_result: Dict[str, Any], table_name: str):
+    def _create_summary_sheet(self, wb, comparison_result: Dict[str, Any], table_name: str, source_env_name: str = None, target_env_name: str = None):
         """Create summary sheet"""
         ws = wb.create_sheet("Summary", 0)
         
@@ -132,9 +134,11 @@ class ExcelGenerator:
         self._apply_header_style(ws, row, 2)
         
         # Statistics rows
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
         stats = [
-            ("Fields Only in Source", len(comparison_result['only_in_source']), self.warning_fill),
-            ("Fields Only in Target", len(comparison_result['only_in_target']), self.warning_fill),
+            (f"Fields Only in {source_label}", len(comparison_result['only_in_source']), self.warning_fill),
+            (f"Fields Only in {target_label}", len(comparison_result['only_in_target']), self.warning_fill),
             ("Fields with Differences", len(comparison_result['field_differences']), self.info_fill),
             ("Matching Fields", len(comparison_result['matching_fields']), self.success_fill)
         ]
@@ -150,9 +154,10 @@ class ExcelGenerator:
         
         self._auto_adjust_columns(ws)
     
-    def _create_only_in_source_sheet(self, wb, comparison_result: Dict[str, Any]):
+    def _create_only_in_source_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None):
         """Create sheet for fields only in source"""
-        ws = wb.create_sheet("Only in Source")
+        sheet_name = f"Only in {source_env_name}" if source_env_name else "Only in Source"
+        ws = wb.create_sheet(sheet_name)
         
         # Headers
         ws['A1'] = "Field Logical Name"
@@ -167,9 +172,10 @@ class ExcelGenerator:
         
         self._auto_adjust_columns(ws)
     
-    def _create_only_in_target_sheet(self, wb, comparison_result: Dict[str, Any]):
+    def _create_only_in_target_sheet(self, wb, comparison_result: Dict[str, Any], target_env_name: str = None):
         """Create sheet for fields only in target"""
-        ws = wb.create_sheet("Only in Target")
+        sheet_name = f"Only in {target_env_name}" if target_env_name else "Only in Target"
+        ws = wb.create_sheet(sheet_name)
         
         # Headers
         ws['A1'] = "Field Logical Name"
@@ -238,7 +244,7 @@ class ExcelGenerator:
         
         self._auto_adjust_columns(ws)
     
-    def generate_data_comparison_report(self, comparison_result: Dict[str, Any], table_name: str, output_file: str):
+    def generate_data_comparison_report(self, comparison_result: Dict[str, Any], table_name: str, output_file: str, source_env_name: str = None, target_env_name: str = None):
         """
         Generate Excel report for data comparison
         
@@ -246,6 +252,8 @@ class ExcelGenerator:
             comparison_result: Dictionary containing comparison results
             table_name: Name of the table being compared
             output_file: Output Excel file path
+            source_env_name: Name of source environment (optional)
+            target_env_name: Name of target environment (optional)
         """
         wb = openpyxl.Workbook()
         
@@ -254,27 +262,27 @@ class ExcelGenerator:
             wb.remove(wb["Sheet"])
         
         # Create Summary sheet
-        self._create_data_summary_sheet(wb, comparison_result, table_name)
+        self._create_data_summary_sheet(wb, comparison_result, table_name, source_env_name, target_env_name)
         
         # Create Records Only in Source sheet
         if comparison_result['only_in_source']:
-            self._create_records_only_in_source_sheet(wb, comparison_result)
+            self._create_records_only_in_source_sheet(wb, comparison_result, source_env_name)
         
         # Create Records Only in Target sheet
         if comparison_result['only_in_target']:
-            self._create_records_only_in_target_sheet(wb, comparison_result)
+            self._create_records_only_in_target_sheet(wb, comparison_result, target_env_name)
         
         # Create Field Mismatches sheet
         if comparison_result['mismatches']:
-            self._create_field_mismatches_sheet(wb, comparison_result)
+            self._create_field_mismatches_sheet(wb, comparison_result, source_env_name, target_env_name)
         
         # Create GUID Mismatches sheet
         if comparison_result.get('guid_mismatches'):
-            self._create_guid_mismatches_sheet(wb, comparison_result)
+            self._create_guid_mismatches_sheet(wb, comparison_result, source_env_name, target_env_name)
         
         # Create Name Matches with Different IDs sheet
         if comparison_result.get('name_matches_with_different_ids'):
-            self._create_name_id_mismatch_sheet(wb, comparison_result)
+            self._create_name_id_mismatch_sheet(wb, comparison_result, source_env_name, target_env_name)
         
         # Create Matching Records sheet
         if comparison_result['matching_records']:
@@ -289,7 +297,7 @@ class ExcelGenerator:
         wb.save(output_file)
         print(f"  Excel report saved to: {output_file}")
     
-    def _create_data_summary_sheet(self, wb, comparison_result: Dict[str, Any], table_name: str):
+    def _create_data_summary_sheet(self, wb, comparison_result: Dict[str, Any], table_name: str, source_env_name: str = None, target_env_name: str = None):
         """Create data comparison summary sheet"""
         ws = wb.create_sheet("Summary", 0)
         
@@ -310,12 +318,14 @@ class ExcelGenerator:
         ws[f'A{row}'].font = Font(bold=True)
         
         row += 1
-        ws[f'A{row}'] = "Source Environment:"
+        source_label = source_env_name if source_env_name else "Source Environment"
+        ws[f'A{row}'] = f"{source_label}:"
         ws[f'B{row}'] = comparison_result['source_url']
         ws[f'A{row}'].font = Font(bold=True)
         
         row += 1
-        ws[f'A{row}'] = "Target Environment:"
+        target_label = target_env_name if target_env_name else "Target Environment"
+        ws[f'A{row}'] = f"{target_label}:"
         ws[f'B{row}'] = comparison_result['target_url']
         ws[f'A{row}'].font = Font(bold=True)
         
@@ -336,12 +346,14 @@ class ExcelGenerator:
         self._apply_header_style(ws, row, 2)
         
         # Statistics rows
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
         unique_mismatch_guids = len(set([m['record_id'] for m in comparison_result['mismatches']])) if comparison_result['mismatches'] else 0
         stats = [
-            ("Source Records (Total)", comparison_result['source_record_count'], None),
-            ("Target Records (Total)", comparison_result['target_record_count'], None),
-            ("GUIDs Only in Source", len(comparison_result['only_in_source']), self.warning_fill),
-            ("GUIDs Only in Target", len(comparison_result['only_in_target']), self.warning_fill),
+            (f"{source_label} Records (Total)", comparison_result['source_record_count'], None),
+            (f"{target_label} Records (Total)", comparison_result['target_record_count'], None),
+            (f"GUIDs Only in {source_label}", len(comparison_result['only_in_source']), self.warning_fill),
+            (f"GUIDs Only in {target_label}", len(comparison_result['only_in_target']), self.warning_fill),
             ("GUIDs with Attribute Mismatches", unique_mismatch_guids, self.info_fill),
             ("Total Field Mismatches", len(comparison_result['mismatches']), self.info_fill),
             ("Lookup Field (GUID) Mismatches", len(comparison_result.get('guid_mismatches', [])), self.warning_fill),
@@ -374,21 +386,22 @@ class ExcelGenerator:
             for child_entity, child_data in comparison_result['child_comparisons'].items():
                 row += 1
                 ws[f'A{row}'] = child_entity
-                ws[f'B{row}'] = f"Source: {child_data['source_total']}, Target: {child_data['target_total']}"
+                ws[f'B{row}'] = f"{source_label}: {child_data['source_total']}, {target_label}: {child_data['target_total']}"
                 ws[f'A{row}'].border = self.border
                 ws[f'B{row}'].border = self.border
         
         self._auto_adjust_columns(ws)
     
-    def _create_records_only_in_source_sheet(self, wb, comparison_result: Dict[str, Any]):
+    def _create_records_only_in_source_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None):
         """Create sheet for records only in source"""
-        ws = wb.create_sheet("GUIDs Only in Source")
+        source_label = source_env_name if source_env_name else "Source"
+        ws = wb.create_sheet(f"GUIDs Only in {source_label}")
         
         if not comparison_result['only_in_source']:
             return
         
         # Add title
-        ws['A1'] = "GUIDs Present in Source but NOT in Target"
+        ws['A1'] = f"GUIDs Present in {source_label} but NOT in Target"
         ws['A1'].font = Font(bold=True, size=12)
         ws.merge_cells('A1:C1')
         
@@ -427,15 +440,16 @@ class ExcelGenerator:
         
         self._auto_adjust_columns(ws)
     
-    def _create_records_only_in_target_sheet(self, wb, comparison_result: Dict[str, Any]):
+    def _create_records_only_in_target_sheet(self, wb, comparison_result: Dict[str, Any], target_env_name: str = None):
         """Create sheet for records only in target"""
-        ws = wb.create_sheet("GUIDs Only in Target")
+        target_label = target_env_name if target_env_name else "Target"
+        ws = wb.create_sheet(f"GUIDs Only in {target_label}")
         
         if not comparison_result['only_in_target']:
             return
         
         # Add title
-        ws['A1'] = "GUIDs Present in Target but NOT in Source"
+        ws['A1'] = f"GUIDs Present in {target_label} but NOT in Source"
         ws['A1'].font = Font(bold=True, size=12)
         ws.merge_cells('A1:C1')
         
@@ -474,7 +488,7 @@ class ExcelGenerator:
         
         self._auto_adjust_columns(ws)
     
-    def _create_field_mismatches_sheet(self, wb, comparison_result: Dict[str, Any]):
+    def _create_field_mismatches_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
         """Create sheet for field mismatches"""
         ws = wb.create_sheet("Attribute Mismatches")
         
@@ -489,8 +503,10 @@ class ExcelGenerator:
         ws.merge_cells(f'A{row}:F{row}')
         
         # Headers (starting at row 4)
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
         row = 4
-        headers = ["Record GUID", "Record Name", "Field Name", "Source Value", "Target Value", "Type"]
+        headers = ["Record GUID", "Record Name", "Field Name", f"{source_label} Value", f"{target_label} Value", "Type"]
         for col, header in enumerate(headers, start=1):
             cell = ws.cell(row=row, column=col)
             cell.value = header
@@ -561,7 +577,7 @@ class ExcelGenerator:
         
         self._auto_adjust_columns(ws)
     
-    def _create_guid_mismatches_sheet(self, wb, comparison_result: Dict[str, Any]):
+    def _create_guid_mismatches_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
         """Create sheet specifically for GUID/Lookup field mismatches"""
         ws = wb.create_sheet("GUID Mismatches")
         
@@ -570,14 +586,17 @@ class ExcelGenerator:
         ws['A1'].font = Font(bold=True, size=12)
         ws.merge_cells('A1:E1')
         
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
+        
         row = 3
-        ws[f'A{row}'] = "These are lookup/relationship fields that point to different records in source vs target."
+        ws[f'A{row}'] = f"These are lookup/relationship fields that point to different records in {source_label} vs {target_label}."
         ws[f'A{row}'].font = Font(italic=True)
         ws.merge_cells(f'A{row}:E{row}')
         
         # Headers
         row += 2
-        headers = ["Record ID", "Record Name", "Field Name", "Source GUID", "Target GUID"]
+        headers = ["Record ID", "Record Name", "Field Name", f"{source_label} GUID", f"{target_label} GUID"]
         for col, header in enumerate(headers, start=1):
             cell = ws.cell(row=row, column=col)
             cell.value = header
@@ -603,7 +622,7 @@ class ExcelGenerator:
         
         self._auto_adjust_columns(ws)
     
-    def _create_name_id_mismatch_sheet(self, wb, comparison_result: Dict[str, Any]):
+    def _create_name_id_mismatch_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
         """Create sheet for records with same name but different IDs"""
         ws = wb.create_sheet("Name-ID Conflicts")
         
@@ -612,6 +631,9 @@ class ExcelGenerator:
         ws['A1'].font = Font(bold=True, size=12)
         ws.merge_cells('A1:D1')
         
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
+        
         row = 3
         ws[f'A{row}'] = "These records have the same primary name field but different IDs. This may indicate duplicates or migration issues."
         ws[f'A{row}'].font = Font(italic=True)
@@ -619,7 +641,7 @@ class ExcelGenerator:
         
         # Headers
         row += 2
-        headers = ["Source ID", "Target ID", f"{comparison_result.get('primary_name_field', 'Name')}", "Status"]
+        headers = [f"{source_label} ID", f"{target_label} ID", f"{comparison_result.get('primary_name_field', 'Name')}", "Status"]
         for col, header in enumerate(headers, start=1):
             cell = ws.cell(row=row, column=col)
             cell.value = header
