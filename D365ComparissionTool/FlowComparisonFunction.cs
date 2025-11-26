@@ -12,6 +12,10 @@ using System.Threading.Tasks;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
+using ClosedXML.Excel;
+using Azure.Storage.Blobs;
+using Azure.Core;
+using Azure.Identity;
 
 namespace D365ComparissionTool;
 
@@ -28,6 +32,12 @@ internal class FlowComparisonRequestPayload
     public string? FlowId { get; set; }
     public string? FlowName { get; set; }
     public List<string>? Flows { get; set; }
+    // Storage configuration (optional) similar to CompareDataverse
+    public string? StorageAccountUrl { get; set; } // e.g. https://account.blob.core.windows.net
+    public string? OutputContainerName { get; set; }
+    public string? OutputFileName { get; set; } // optional override
+    public string? StorageConnectionString { get; set; }
+    public string? StorageContainerSasUrl { get; set; } // full https://.../container?sv=...
 }
 
 internal record FlowSnapshot(string Name, Guid FlowId, string Environment, string CanonicalJson, string Hash, string? Error);
@@ -51,7 +61,10 @@ internal record FlowComparisonResponse(List<FlowSnapshot> Env1Flows,
     List<string> NonIdenticalFlows,
     int MissingInEnv2Count,
     int ErrorCount,
-    string Notes);
+    string Notes,
+    string? ExcelBlobUrl,
+    bool Env1AuthFailed,
+    bool Env2AuthFailed);
 
 public class FlowComparisonFunction
 {
@@ -143,24 +156,52 @@ public class FlowComparisonFunction
         var env2Flows = new List<FlowSnapshot>();
         string notes = string.Empty;
         var fetchStart = DateTime.UtcNow;
+        bool env1AuthFailed = false;
+        bool env2AuthFailed = false;
 
         try
         {
             if (mode == "all")
             {
-                env1Flows = await FetchAndPrepareAllFlows(env1, token1, ignoreKeys, correlationId);
-                if (env2 != null) env2Flows = await FetchAndPrepareAllFlows(env2, token2!, ignoreKeys, correlationId);
+                try
+                {
+                    env1Flows = await FetchAndPrepareAllFlows(env1, token1, ignoreKeys, correlationId);
+                }
+                catch (HttpRequestException hex) when (hex.Message.Contains("401"))
+                {
+                    env1AuthFailed = true; notes += " Env1 unauthorized.";
+                }
+                if (env2 != null)
+                {
+                    try { env2Flows = await FetchAndPrepareAllFlows(env2, token2!, ignoreKeys, correlationId); }
+                    catch (HttpRequestException hex) when (hex.Message.Contains("401"))
+                    { env2AuthFailed = true; notes += " Env2 unauthorized."; }
+                }
             }
             else if (mode == "single")
             {
                 string identifier = payload.FlowId ?? payload.FlowName!;
                 _logger.LogInformation("[CompareFlows:{CorrelationId}] Single identifier={Identifier}", correlationId, identifier);
-                var snap1 = await FetchSingleFlow(env1, token1, identifier, ignoreKeys, correlationId);
-                if (snap1 != null) env1Flows.Add(snap1);
+                try
+                {
+                    var snap1 = await FetchSingleFlow(env1, token1, identifier, ignoreKeys, correlationId);
+                    if (snap1 != null) env1Flows.Add(snap1);
+                }
+                catch (HttpRequestException hex) when (hex.Message.Contains("401"))
+                {
+                    env1AuthFailed = true; notes += " Env1 unauthorized.";
+                }
                 if (env2 != null)
                 {
-                    var snap2 = await FetchSingleFlow(env2, token2!, identifier, ignoreKeys, correlationId, payload.MatchBy);
-                    if (snap2 != null) env2Flows.Add(snap2);
+                    try
+                    {
+                        var snap2 = await FetchSingleFlow(env2, token2!, identifier, ignoreKeys, correlationId, payload.MatchBy);
+                        if (snap2 != null) env2Flows.Add(snap2);
+                    }
+                    catch (HttpRequestException hex) when (hex.Message.Contains("401"))
+                    {
+                        env2AuthFailed = true; notes += " Env2 unauthorized.";
+                    }
                 }
             }
             else if (mode == "list")
@@ -168,23 +209,43 @@ public class FlowComparisonFunction
                 _logger.LogInformation("[CompareFlows:{CorrelationId}] List mode count={Count}", correlationId, payload.Flows!.Count);
                 foreach (var f in payload.Flows!)
                 {
-                    var s = await FetchSingleFlow(env1, token1, f, ignoreKeys, correlationId);
-                    if (s != null) env1Flows.Add(s);
+                    try
+                    {
+                        var s = await FetchSingleFlow(env1, token1, f, ignoreKeys, correlationId);
+                        if (s != null) env1Flows.Add(s);
+                    }
+                    catch (HttpRequestException hex) when (hex.Message.Contains("401"))
+                    {
+                        env1AuthFailed = true; notes += " Env1 unauthorized."; break; // stop further attempts
+                    }
                 }
                 if (env2 != null)
                 {
                     foreach (var f in payload.Flows!)
                     {
-                        var s = await FetchSingleFlow(env2, token2!, f, ignoreKeys, correlationId);
-                        if (s != null) env2Flows.Add(s);
+                        if (env2AuthFailed) break;
+                        try
+                        {
+                            var s = await FetchSingleFlow(env2, token2!, f, ignoreKeys, correlationId);
+                            if (s != null) env2Flows.Add(s);
+                        }
+                        catch (HttpRequestException hex) when (hex.Message.Contains("401"))
+                        {
+                            env2AuthFailed = true; notes += " Env2 unauthorized."; break;
+                        }
                     }
                 }
             }
             else
             {
                 notes = "Unknown mode; defaulted to all.";
-                env1Flows = await FetchAndPrepareAllFlows(env1, token1, ignoreKeys, correlationId);
-                if (env2 != null) env2Flows = await FetchAndPrepareAllFlows(env2, token2!, ignoreKeys, correlationId);
+                try { env1Flows = await FetchAndPrepareAllFlows(env1, token1, ignoreKeys, correlationId); }
+                catch (HttpRequestException hex) when (hex.Message.Contains("401")) { env1AuthFailed = true; notes += " Env1 unauthorized."; }
+                if (env2 != null)
+                {
+                    try { env2Flows = await FetchAndPrepareAllFlows(env2, token2!, ignoreKeys, correlationId); }
+                    catch (HttpRequestException hex) when (hex.Message.Contains("401")) { env2AuthFailed = true; notes += " Env2 unauthorized."; }
+                }
             }
         }
         catch (Exception ex)
@@ -198,6 +259,7 @@ public class FlowComparisonFunction
         _logger.LogInformation("[CompareFlows:{CorrelationId}] Fetch+Prepare completed Env1Count={Env1Count} Env2Count={Env2Count} DurationMs={Duration}", correlationId, env1Flows.Count, env2Flows.Count, fetchDurationMs);
 
         var comparisons = new List<FlowComparisonResult>();
+        var comparisonTimestampUtc = DateTime.UtcNow;
         if (env2 != null)
         {
             string matchBy = (payload.MatchBy?.Trim().ToLowerInvariant()) switch
@@ -248,7 +310,36 @@ public class FlowComparisonFunction
         int errorCount = comparisons.Count(c => c.Status == "error");
         var identicalFlows = comparisons.Where(c => c.Identical).Select(c => c.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         var nonIdenticalFlows = comparisons.Where(c => c.Status == "different").Select(c => c.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        var responseObj = new FlowComparisonResponse(env1Flows, env2Flows, comparisons, identicalFlows, nonIdenticalFlows, missingCount, errorCount, notes);
+        // Excel build & upload
+        string? excelBlobUrl = null;
+        try
+        {
+            var wbBytes = BuildFlowComparisonExcel(env1Flows, env2Flows, comparisons, env1, env2, comparisonTimestampUtc);
+            string storageUrl = payload.StorageAccountUrl ?? Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL") ?? string.Empty;
+            string containerName = payload.OutputContainerName ?? Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER") ?? "comparissiontooloutput";
+            string blobName = GenerateFlowBlobName(env1, env2, payload.OutputFileName);
+            if (!string.IsNullOrWhiteSpace(payload.StorageContainerSasUrl))
+                excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, containerSasUrl: payload.StorageContainerSasUrl);
+            else if (!string.IsNullOrWhiteSpace(payload.StorageConnectionString))
+                excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, connectionString: payload.StorageConnectionString, containerName: containerName);
+            else if (!string.IsNullOrWhiteSpace(storageUrl))
+            {
+                var credential = new DefaultAzureCredential();
+                excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, accountUrl: storageUrl, containerName: containerName, credential: credential);
+            }
+            else
+            {
+                notes += (string.IsNullOrEmpty(notes) ? string.Empty : " ") + "No storage configuration provided; Excel not uploaded.";
+            }
+            if (!string.IsNullOrWhiteSpace(excelBlobUrl))
+                _logger.LogInformation("[CompareFlows:{CorrelationId}] Excel uploaded BlobUrl={BlobUrl} SizeBytes={Size}", correlationId, excelBlobUrl, wbBytes.Length);
+        }
+        catch (Exception exUp)
+        {
+            _logger.LogError(exUp, "[CompareFlows:{CorrelationId}] Excel generation/upload failed", correlationId);
+            notes += (string.IsNullOrEmpty(notes) ? string.Empty : " ") + "Excel generation/upload failed: " + exUp.Message;
+        }
+        var responseObj = new FlowComparisonResponse(env1Flows, env2Flows, comparisons, identicalFlows, nonIdenticalFlows, missingCount, errorCount, notes, excelBlobUrl, env1AuthFailed, env2AuthFailed);
         var resp = req.CreateResponse(System.Net.HttpStatusCode.OK);
         resp.Headers.Add("Content-Type", "application/json");
         await resp.WriteStringAsync(JsonSerializer.Serialize(responseObj, new JsonSerializerOptions { WriteIndented = true }));
@@ -539,6 +630,156 @@ public class FlowComparisonFunction
         using var sha = SHA256.Create();
         var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(canonical));
         return BitConverter.ToString(bytes).Replace("-", string.Empty).ToLowerInvariant();
+    }
+
+    // Excel helpers (outside comparison loop)
+    private static byte[] BuildFlowComparisonExcel(List<FlowSnapshot> env1Flows, List<FlowSnapshot> env2Flows, List<FlowComparisonResult> comparisons, string env1Host, string? env2Host, DateTime comparisonTimestampUtc)
+    {
+        using var wb = new XLWorkbook();
+        var summary = wb.Worksheets.Add("Summary");
+        summary.Cell(1,1).Value = "Env1";
+        summary.Cell(1,2).Value = "Env2";
+        summary.Cell(1,3).Value = "Comparison Date and Time";
+        summary.Cell(1,4).Value = "Env1 Flow Count";
+        summary.Cell(1,5).Value = "Env2 Flow Count";
+        summary.Cell(1,6).Value = "Identical";
+        summary.Cell(1,7).Value = "Different";
+        summary.Cell(1,8).Value = "Missing In Env2";
+        summary.Cell(1,9).Value = "Errors";
+        summary.Cell(2,1).Value = env1Host;
+        summary.Cell(2,2).Value = env2Host ?? "(single-env)";
+        summary.Cell(2,3).Value = comparisonTimestampUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+        summary.Cell(2,4).Value = env1Flows.Count;
+        summary.Cell(2,5).Value = env2Flows.Count;
+        summary.Cell(2,6).Value = comparisons.Count(c => c.Identical);
+        summary.Cell(2,7).Value = comparisons.Count(c => c.Status == "different");
+        summary.Cell(2,8).Value = comparisons.Count(c => c.Status == "missing_in_env2");
+        summary.Cell(2,9).Value = comparisons.Count(c => c.Status == "error");
+        summary.Columns().AdjustToContents();
+
+        var overview = wb.Worksheets.Add("FlowOverview");
+        overview.Cell(1,1).Value = "Name";
+        overview.Cell(1,2).Value = "Status";
+        overview.Cell(1,3).Value = "Identical";
+        overview.Cell(1,4).Value = "Env1 FlowId";
+        overview.Cell(1,5).Value = "Env2 FlowId";
+        overview.Cell(1,6).Value = "Env1 Hash";
+        overview.Cell(1,7).Value = "Env2 Hash";
+        overview.Cell(1,8).Value = "AddedPaths";
+        overview.Cell(1,9).Value = "RemovedPaths";
+        overview.Cell(1,10).Value = "ChangedPaths";
+        overview.Cell(1,11).Value = "ActionDiffs";
+        overview.Cell(1,12).Value = "Env1Error";
+        overview.Cell(1,13).Value = "Env2Error";
+        int or = 2;
+        foreach (var cmp in comparisons)
+        {
+            overview.Cell(or,1).Value = cmp.Name;
+            overview.Cell(or,2).Value = cmp.Status;
+            overview.Cell(or,3).Value = cmp.Identical ? 1 : 0;
+            overview.Cell(or,4).Value = cmp.Env1?.FlowId.ToString() ?? string.Empty;
+            overview.Cell(or,5).Value = cmp.Env2?.FlowId.ToString() ?? string.Empty;
+            overview.Cell(or,6).Value = cmp.Env1?.Hash ?? string.Empty;
+            overview.Cell(or,7).Value = cmp.Env2?.Hash ?? string.Empty;
+            overview.Cell(or,8).Value = cmp.Diff?.Added.Count ?? 0;
+            overview.Cell(or,9).Value = cmp.Diff?.Removed.Count ?? 0;
+            overview.Cell(or,10).Value = cmp.Diff?.Changed.Count ?? 0;
+            overview.Cell(or,11).Value = cmp.ActionDifferences?.Count ?? 0;
+            overview.Cell(or,12).Value = cmp.Env1?.Error ?? string.Empty;
+            overview.Cell(or,13).Value = cmp.Env2?.Error ?? string.Empty;
+            or++;
+        }
+        overview.Columns().AdjustToContents();
+
+        var diffWs = wb.Worksheets.Add("Differences");
+        diffWs.Cell(1,1).Value = "FlowName";
+        diffWs.Cell(1,2).Value = "PathType";
+        diffWs.Cell(1,3).Value = "Path";
+        diffWs.Cell(1,4).Value = "OldValue";
+        diffWs.Cell(1,5).Value = "NewValue";
+        int dr = 2;
+        foreach (var cmp in comparisons.Where(c => c.Status == "different" && c.Diff != null))
+        {
+            foreach (var a in cmp.Diff!.Added) { diffWs.Cell(dr,1).Value = cmp.Name; diffWs.Cell(dr,2).Value = "Added"; diffWs.Cell(dr,3).Value = a; diffWs.Cell(dr,4).Value = string.Empty; diffWs.Cell(dr,5).Value = "(added)"; dr++; }
+            foreach (var r in cmp.Diff!.Removed) { diffWs.Cell(dr,1).Value = cmp.Name; diffWs.Cell(dr,2).Value = "Removed"; diffWs.Cell(dr,3).Value = r; diffWs.Cell(dr,4).Value = "(removed)"; diffWs.Cell(dr,5).Value = string.Empty; dr++; }
+            foreach (var ch in cmp.Diff!.Changed) { diffWs.Cell(dr,1).Value = cmp.Name; diffWs.Cell(dr,2).Value = "Changed"; diffWs.Cell(dr,3).Value = ch.Path; diffWs.Cell(dr,4).Value = TrimForExcel(ch.OldValue); diffWs.Cell(dr,5).Value = TrimForExcel(ch.NewValue); dr++; }
+        }
+        diffWs.Columns().AdjustToContents();
+
+        var actionWs = wb.Worksheets.Add("ActionDifferences");
+        actionWs.Cell(1,1).Value = "FlowName";
+        actionWs.Cell(1,2).Value = "ActionName";
+        actionWs.Cell(1,3).Value = "Status";
+        actionWs.Cell(1,4).Value = "ChangedPropertyCount";
+        actionWs.Cell(1,5).Value = "ChangedProperties (Path=Old=>New)";
+        int ar = 2;
+        foreach (var cmp in comparisons.Where(c => c.ActionDifferences != null && c.ActionDifferences.Count > 0))
+        {
+            foreach (var ad in cmp.ActionDifferences!)
+            {
+                actionWs.Cell(ar,1).Value = cmp.Name;
+                actionWs.Cell(ar,2).Value = ad.ActionName;
+                actionWs.Cell(ar,3).Value = ad.Status;
+                actionWs.Cell(ar,4).Value = ad.ChangedProperties.Count;
+                var combined = string.Join(" | ", ad.ChangedProperties.Select(cp => cp.Path + "=" + TrimForExcel(cp.OldValue) + "=>" + TrimForExcel(cp.NewValue)));
+                actionWs.Cell(ar,5).Value = TrimForExcel(combined);
+                ar++;
+            }
+        }
+        actionWs.Columns().AdjustToContents();
+
+        using var ms = new MemoryStream();
+        wb.SaveAs(ms);
+        return ms.ToArray();
+
+        static string TrimForExcel(string? v)
+        {
+            if (string.IsNullOrEmpty(v)) return string.Empty;
+            const int ExcelMaxCellLength = 32767;
+            return v.Length <= ExcelMaxCellLength ? v : v.Substring(0, ExcelMaxCellLength - 15) + "...(truncated)";
+        }
+    }
+
+    private static string GenerateFlowBlobName(string env1Host, string? env2Host, string? overrideName)
+    {
+        if (!string.IsNullOrWhiteSpace(overrideName))
+        {
+            var safe = new string(overrideName.Where(ch => char.IsLetterOrDigit(ch) || ch=='-' || ch=='_' || ch=='.').ToArray());
+            if (!safe.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase)) safe += ".xlsx";
+            return safe;
+        }
+        var ts = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+        return !string.IsNullOrWhiteSpace(env2Host) ? $"flowcomparison-{env1Host}-vs-{env2Host}-{ts}.xlsx" : $"flowcomparison-{env1Host}-{ts}.xlsx";
+    }
+
+    private static async Task<string> UploadExcelWithFlexibleAuthAsync(byte[] bytes, string blobName, string? accountUrl = null, string? containerName = null, TokenCredential? credential = null, string? connectionString = null, string? containerSasUrl = null)
+    {
+        BlobContainerClient containerClient;
+        if (!string.IsNullOrWhiteSpace(containerSasUrl))
+        {
+            var raw = containerSasUrl.Trim();
+            if (!Uri.TryCreate(raw, UriKind.Absolute, out var sasUri)) throw new ArgumentException("StorageContainerSasUrl invalid absolute URI");
+            if (string.IsNullOrEmpty(sasUri.Query)) throw new ArgumentException("StorageContainerSasUrl missing SAS query params");
+            containerClient = new BlobContainerClient(sasUri);
+        }
+        else if (!string.IsNullOrWhiteSpace(connectionString) && !string.IsNullOrWhiteSpace(containerName))
+        {
+            containerClient = new BlobServiceClient(connectionString).GetBlobContainerClient(containerName);
+        }
+        else if (!string.IsNullOrWhiteSpace(accountUrl) && credential != null && !string.IsNullOrWhiteSpace(containerName))
+        {
+            containerClient = new BlobServiceClient(new Uri(accountUrl), credential).GetBlobContainerClient(containerName);
+        }
+        else
+        {
+            throw new InvalidOperationException("Insufficient storage parameters provided.");
+        }
+        if (!string.IsNullOrWhiteSpace(connectionString) || (!string.IsNullOrWhiteSpace(accountUrl) && credential != null))
+            await containerClient.CreateIfNotExistsAsync();
+        using var ms = new MemoryStream(bytes);
+        var blob = containerClient.GetBlobClient(blobName);
+        await blob.UploadAsync(ms, overwrite: true);
+        return blob.Uri.ToString();
     }
 
     private static FlowComparisonDiff ComputeDiff(string jsonA, string jsonB)

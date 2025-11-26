@@ -12,6 +12,8 @@ using Microsoft.Azure.Functions.Worker.Http;
 using Microsoft.Extensions.Logging;
 using Azure.Storage.Blobs;
 using ClosedXML.Excel;
+using System.Xml.Linq;
+using System.Text.RegularExpressions;
 
 namespace D365ComparissionTool;
 
@@ -255,13 +257,46 @@ public class ConfigurationComparisionFunction
                 {
                     var original = request.EntityLogicalName;
                     request.EntityLogicalName = entity;
-                    var report = await CompareSingleEntityAsync(request, singleSourceToken, singleTargetToken, credential, correlationId);
+                    // Skip individual Excel uploads; aggregate later
+                    var report = await CompareSingleEntityAsync(request, singleSourceToken, singleTargetToken, credential, correlationId, skipExcelUpload: true);
                     results.Add((entity, report));
                     request.EntityLogicalName = original; // restore
                 }
+                // Build combined Excel if storage settings provided
+                string combinedBlobUrl = null;
+                try
+                {
+                    string storageUrl = request.StorageAccountUrl ?? Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL") ?? string.Empty;
+                    string containerName = request.OutputContainerName ?? Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER") ?? "comparissiontooloutput";
+                    byte[] excelBytes = BuildMultiEntityExcel(results, request.SourceEnvUrl, request.TargetEnvUrl, DateTime.UtcNow);
+                    _logger.LogInformation("[{CorrelationId}] Combined Excel size bytes={Size}", correlationId, excelBytes.Length);
+                    if (!string.IsNullOrWhiteSpace(request.StorageContainerSasUrl))
+                    {
+                        combinedBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, "multi", isCombined: true), containerSasUrl: request.StorageContainerSasUrl);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(request.StorageConnectionString))
+                    {
+                        combinedBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, "multi", isCombined: true), connectionString: request.StorageConnectionString, containerName: containerName);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(storageUrl))
+                    {
+                        var credential2 = new DefaultAzureCredential();
+                        combinedBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, "multi", isCombined: true), accountUrl: storageUrl, containerName: containerName, credential: credential2);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("[{CorrelationId}] No storage configuration provided; combined Excel not uploaded", correlationId);
+                    }
+                }
+                catch (Exception exUp)
+                {
+                    _logger.LogError(exUp, "[{CorrelationId}] Combined Excel upload failed", correlationId);
+                }
+
                 var payload = new
                 {
                     Mode = mode,
+                    CombinedExcelBlobUrl = combinedBlobUrl,
                     Results = results.Select(r => new { EntityLogicalName = r.Entity, Report = r.Report }).ToList()
                 };
                 string json = JsonSerializer.Serialize(payload, JsonOptions);
@@ -280,7 +315,7 @@ public class ConfigurationComparisionFunction
         }
     }
 
-    private async Task<DiffReport> CompareSingleEntityAsync(ComparisonRequest request, string sourceToken, string targetToken, DefaultAzureCredential credential, Guid correlationId)
+    private async Task<DiffReport> CompareSingleEntityAsync(ComparisonRequest request, string sourceToken, string targetToken, DefaultAzureCredential credential, Guid correlationId, bool skipExcelUpload = false)
     {
         _logger.LogInformation("[{CorrelationId}] Request Entity={Entity} Source={Source} Target={Target} OutputContainer={Container} OutputFileName={FileName}", correlationId, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl, request.OutputContainerName, request.OutputFileName);
 
@@ -558,68 +593,343 @@ public class ConfigurationComparisionFunction
             }
         }
 
-        // Excel upload (optional)
-        string storageUrl = request.StorageAccountUrl ?? Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL") ?? string.Empty;
-        string containerName = request.OutputContainerName ?? Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER") ?? "comparissiontooloutput";
-        if (!string.IsNullOrWhiteSpace(request.StorageContainerSasUrl))
+        if (!skipExcelUpload)
         {
-            _logger.LogInformation("[{CorrelationId}] Using SAS URL for upload", correlationId);
-            try
+            // Excel upload (optional - single entity mode)
+            string storageUrl = request.StorageAccountUrl ?? Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL") ?? string.Empty;
+            string containerName = request.OutputContainerName ?? Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER") ?? "comparissiontooloutput";
+            if (!string.IsNullOrWhiteSpace(request.StorageContainerSasUrl))
             {
-                string blobName = GenerateBlobName(request.EntityLogicalName);
-                var excelBytes = BuildExcel(report, request.EntityLogicalName);
-                _logger.LogDebug("[{CorrelationId}] Excel size bytes={Size}", correlationId, excelBytes.Length);
-                report.ExcelBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, containerSasUrl: request.StorageContainerSasUrl);
-                _logger.LogInformation("[{CorrelationId}] Excel uploaded via SAS BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
+                _logger.LogInformation("[{CorrelationId}] Using SAS URL for upload", correlationId);
+                try
+                {
+                    string blobName = GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, request.EntityLogicalName);
+                    var excelBytes = BuildExcel(report, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl, DateTime.UtcNow);
+                    _logger.LogDebug("[{CorrelationId}] Excel size bytes={Size}", correlationId, excelBytes.Length);
+                    report.ExcelBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, containerSasUrl: request.StorageContainerSasUrl);
+                    _logger.LogInformation("[{CorrelationId}] Excel uploaded via SAS BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
+                }
+                catch (Exception upEx)
+                {
+                    _logger.LogError(upEx, "[{CorrelationId}] Excel upload failed (SAS)", correlationId);
+                    report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Excel upload failed (SAS): " + upEx.Message;
+                }
             }
-            catch (Exception upEx)
+            else if (!string.IsNullOrWhiteSpace(request.StorageConnectionString))
             {
-                _logger.LogError(upEx, "[{CorrelationId}] Excel upload failed (SAS)", correlationId);
-                report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Excel upload failed (SAS): " + upEx.Message;
+                _logger.LogInformation("[{CorrelationId}] Using connection string for upload", correlationId);
+                try
+                {
+                    string blobName = GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, request.EntityLogicalName);
+                    var excelBytes = BuildExcel(report, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl, DateTime.UtcNow);
+                    _logger.LogDebug("[{CorrelationId}] Excel size bytes={Size}", correlationId, excelBytes.Length);
+                    report.ExcelBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, connectionString: request.StorageConnectionString, containerName: containerName);
+                    _logger.LogInformation("[{CorrelationId}] Excel uploaded via connection string BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
+                }
+                catch (Exception upEx)
+                {
+                    _logger.LogError(upEx, "[{CorrelationId}] Excel upload failed (ConnStr)", correlationId);
+                    report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Excel upload failed (ConnStr): " + upEx.Message;
+                }
             }
-        }
-        else if (!string.IsNullOrWhiteSpace(request.StorageConnectionString))
-        {
-            _logger.LogInformation("[{CorrelationId}] Using connection string for upload", correlationId);
-            try
+            else if (!string.IsNullOrWhiteSpace(storageUrl))
             {
-                string blobName = GenerateBlobName(request.EntityLogicalName);
-                var excelBytes = BuildExcel(report, request.EntityLogicalName);
-                _logger.LogDebug("[{CorrelationId}] Excel size bytes={Size}", correlationId, excelBytes.Length);
-                report.ExcelBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, connectionString: request.StorageConnectionString, containerName: containerName);
-                _logger.LogInformation("[{CorrelationId}] Excel uploaded via connection string BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
+                _logger.LogInformation("[{CorrelationId}] Using managed identity for upload AccountUrl={AccountUrl} Container={Container}", correlationId, storageUrl, containerName);
+                try
+                {
+                    string blobName = GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, request.EntityLogicalName);
+                    var excelBytes = BuildExcel(report, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl, DateTime.UtcNow);
+                    _logger.LogDebug("[{CorrelationId}] Excel size bytes={Size}", correlationId, excelBytes.Length);
+                    report.ExcelBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, accountUrl: storageUrl, containerName: containerName, credential: credential);
+                    _logger.LogInformation("[{CorrelationId}] Excel uploaded via identity BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
+                }
+                catch (Exception upEx)
+                {
+                    _logger.LogError(upEx, "[{CorrelationId}] Excel upload failed (Identity)", correlationId);
+                    report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Excel upload failed (Identity): " + upEx.Message;
+                }
             }
-            catch (Exception upEx)
+            else
             {
-                _logger.LogError(upEx, "[{CorrelationId}] Excel upload failed (ConnStr)", correlationId);
-                report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Excel upload failed (ConnStr): " + upEx.Message;
+                _logger.LogWarning("[{CorrelationId}] No storage configuration provided; Excel skipped", correlationId);
+                report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "No storage configuration provided; Excel not generated.";
             }
-        }
-        else if (!string.IsNullOrWhiteSpace(storageUrl))
-        {
-            _logger.LogInformation("[{CorrelationId}] Using managed identity for upload AccountUrl={AccountUrl} Container={Container}", correlationId, storageUrl, containerName);
-            try
-            {
-                string blobName = GenerateBlobName(request.EntityLogicalName);
-                var excelBytes = BuildExcel(report, request.EntityLogicalName);
-                _logger.LogDebug("[{CorrelationId}] Excel size bytes={Size}", correlationId, excelBytes.Length);
-                report.ExcelBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, accountUrl: storageUrl, containerName: containerName, credential: credential);
-                _logger.LogInformation("[{CorrelationId}] Excel uploaded via identity BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
-            }
-            catch (Exception upEx)
-            {
-                _logger.LogError(upEx, "[{CorrelationId}] Excel upload failed (Identity)", correlationId);
-                report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Excel upload failed (Identity): " + upEx.Message;
-            }
-        }
-        else
-        {
-            _logger.LogWarning("[{CorrelationId}] No storage configuration provided; Excel skipped", correlationId);
-            report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "No storage configuration provided; Excel not generated.";
         }
 
         _logger.LogInformation("[{CorrelationId}] Comparison completed Entity={Entity} ExcelUrl={ExcelUrl}", correlationId, request.EntityLogicalName, report.ExcelBlobUrl ?? "(none)");
         return report;
+    }
+
+    // Build a combined multi-entity Excel workbook (one run, multiple entities)
+    private static byte[] BuildMultiEntityExcel(List<(string Entity, DiffReport Report)> results, string sourceEnvUrl, string targetEnvUrl, DateTime comparisonTimestampUtc)
+    {
+        const int ExcelMaxCellLength = 32767;
+        string Truncate(string? v) => string.IsNullOrEmpty(v) ? v ?? string.Empty : (v.Length <= ExcelMaxCellLength ? v : v.Substring(0, ExcelMaxCellLength - 15) + "...(truncated)");
+        string BuildRecordUrl(string envUrl, string etn, Guid id) => string.IsNullOrWhiteSpace(envUrl) || string.IsNullOrWhiteSpace(etn) || id == Guid.Empty ? string.Empty : envUrl.TrimEnd('/') + $"/main.aspx?etn={etn}&id={id}&pagetype=entityrecord";
+
+        using var wb = new XLWorkbook();
+
+        // Summary sheet
+        var summary = wb.Worksheets.Add("Summary");
+        summary.Cell(1,1).Value = "Source Env";
+        summary.Cell(1,2).Value = "Target Env";
+        summary.Cell(1,3).Value = "Comparission Date and Time";
+        summary.Cell(1,4).Value = "Entity";
+        summary.Cell(1,5).Value = "Compared Fields";
+        summary.Cell(1,6).Value = "Matching Records";
+        summary.Cell(1,7).Value = "Mismatches";
+        summary.Cell(1,8).Value = "Only In Source";
+        summary.Cell(1,9).Value = "Only In Target";
+        summary.Cell(1,10).Value = "Notes";
+        int sr = 2;
+        foreach (var (Entity, Report) in results)
+        {
+            summary.Cell(sr,1).Value = sourceEnvUrl;
+            summary.Cell(sr,2).Value = targetEnvUrl;
+            summary.Cell(sr,3).Value = comparisonTimestampUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+            summary.Cell(sr,4).Value = Entity;
+            summary.Cell(sr,5).Value = Truncate(string.Join(',', Report.ComparedFields));
+            summary.Cell(sr,6).Value = Report.MatchingRecordIds.Count;
+            summary.Cell(sr,7).Value = Report.Mismatches.Count;
+            summary.Cell(sr,8).Value = Report.OnlyInSource.Count;
+            summary.Cell(sr,9).Value = Report.OnlyInTarget.Count;
+            summary.Cell(sr,10).Value = Truncate(Report.Notes);
+            sr++;
+        }
+        summary.Columns().AdjustToContents();
+
+        // Aggregated MatchingRecords sheet
+        var matchWs = wb.Worksheets.Add("MatchingRecords");
+        matchWs.Cell(1,1).Value = "Entity";
+        matchWs.Cell(1,2).Value = "RecordId";
+        matchWs.Cell(1,3).Value = "SourceRecordUrl";
+        matchWs.Cell(1,4).Value = "TargetRecordUrl";
+        int mr = 2;
+        foreach (var (Entity, Report) in results)
+        {
+            foreach (var id in Report.MatchingRecordIds)
+            {
+                matchWs.Cell(mr,1).Value = Entity;
+                matchWs.Cell(mr,2).Value = id.ToString();
+                matchWs.Cell(mr,3).Value = BuildRecordUrl(sourceEnvUrl, Entity, id);
+                matchWs.Cell(mr,4).Value = BuildRecordUrl(targetEnvUrl, Entity, id);
+                mr++;
+            }
+        }
+        matchWs.Columns().AdjustToContents();
+
+        // Aggregated Mismatches sheet
+        var mismatchWs = wb.Worksheets.Add("Mismatches");
+        mismatchWs.Cell(1,1).Value = "Entity";
+        mismatchWs.Cell(1,2).Value = "RecordId";
+        mismatchWs.Cell(1,3).Value = "SourceRecordUrl";
+        mismatchWs.Cell(1,4).Value = "TargetRecordUrl";
+        mismatchWs.Cell(1,5).Value = "FieldName";
+        mismatchWs.Cell(1,6).Value = "SourceValue";
+        mismatchWs.Cell(1,7).Value = "TargetValue";
+        int mmr = 2;
+        foreach (var (Entity, Report) in results)
+        {
+            foreach (var m in Report.Mismatches)
+            {
+                mismatchWs.Cell(mmr,1).Value = Entity;
+                mismatchWs.Cell(mmr,2).Value = m.RecordId.ToString();
+                mismatchWs.Cell(mmr,3).Value = BuildRecordUrl(sourceEnvUrl, Entity, m.RecordId);
+                mismatchWs.Cell(mmr,4).Value = BuildRecordUrl(targetEnvUrl, Entity, m.RecordId);
+                mismatchWs.Cell(mmr,5).Value = m.FieldName;
+                mismatchWs.Cell(mmr,6).Value = Truncate(m.SourceValue?.ToString());
+                mismatchWs.Cell(mmr,7).Value = Truncate(m.TargetValue?.ToString());
+                mmr++;
+            }
+        }
+        mismatchWs.Columns().AdjustToContents();
+
+        // Aggregated OnlyInSource sheet
+        var onlySrcWs = wb.Worksheets.Add("OnlyInSource");
+        onlySrcWs.Cell(1,1).Value = "Entity";
+        onlySrcWs.Cell(1,2).Value = "RecordId";
+        onlySrcWs.Cell(1,3).Value = "SourceRecordUrl";
+        int osr = 2; 
+        foreach (var (Entity, Report) in results)
+        {
+            string pk = Entity + "id";
+            foreach (var rec in Report.OnlyInSource)
+            {
+                if (rec.TryGetValue(pk, out var idVal) && Guid.TryParse(idVal?.ToString(), out var gid))
+                {
+                    onlySrcWs.Cell(osr,1).Value = Entity;
+                    onlySrcWs.Cell(osr,2).Value = gid.ToString();
+                    onlySrcWs.Cell(osr,3).Value = BuildRecordUrl(sourceEnvUrl, Entity, gid);
+                    osr++;
+                }
+            }
+        }
+        onlySrcWs.Columns().AdjustToContents();
+
+        // Aggregated OnlyInTarget sheet
+        var onlyTgtWs = wb.Worksheets.Add("OnlyInTarget");
+        onlyTgtWs.Cell(1,1).Value = "Entity";
+        onlyTgtWs.Cell(1,2).Value = "RecordId";
+        onlyTgtWs.Cell(1,3).Value = "TargetRecordUrl";
+        int otr = 2; 
+        foreach (var (Entity, Report) in results)
+        {
+            string pk = Entity + "id";
+            foreach (var rec in Report.OnlyInTarget)
+            {
+                if (rec.TryGetValue(pk, out var idVal) && Guid.TryParse(idVal?.ToString(), out var gid))
+                {
+                    onlyTgtWs.Cell(otr,1).Value = Entity;
+                    onlyTgtWs.Cell(otr,2).Value = gid.ToString();
+                    onlyTgtWs.Cell(otr,3).Value = BuildRecordUrl(targetEnvUrl, Entity, gid);
+                    otr++;
+                }
+            }
+        }
+        onlyTgtWs.Columns().AdjustToContents();
+
+        // Child diff sheets remain per entity to avoid overly large aggregation
+        foreach (var (Entity, Report) in results)
+        {
+            foreach (var child in Report.ChildDiffs.Values)
+            {
+                var cSummary = wb.Worksheets.Add($"{Entity}_Child_{child.ChildEntityLogicalName}_Summary".Replace('-', '_'));
+                cSummary.Cell(1,1).Value = "ParentEntity"; cSummary.Cell(1,2).Value = Entity;
+                cSummary.Cell(2,1).Value = "ChildEntity"; cSummary.Cell(2,2).Value = child.ChildEntityLogicalName;
+                cSummary.Cell(3,1).Value = "ComparedChildFields"; cSummary.Cell(3,2).Value = Truncate(string.Join(',', child.ComparedChildFields));
+                cSummary.Cell(4,1).Value = "SourceChildRecords"; cSummary.Cell(4,2).Value = child.TotalSourceChildRecords;
+                cSummary.Cell(5,1).Value = "TargetChildRecords"; cSummary.Cell(5,2).Value = child.TotalTargetChildRecords;
+                cSummary.Cell(6,1).Value = "ChildMismatches"; cSummary.Cell(6,2).Value = child.Mismatches.Count;
+                cSummary.Cell(7,1).Value = "ChildMultiFieldMismatches"; cSummary.Cell(7,2).Value = child.MultiFieldMismatches.Count;
+                cSummary.Columns().AdjustToContents();
+
+                var cMismatch = wb.Worksheets.Add($"{Entity}_Child_{child.ChildEntityLogicalName}_Mismatches".Replace('-', '_'));
+                cMismatch.Cell(1,1).Value = "ParentId";
+                cMismatch.Cell(1,2).Value = "ChildId";
+                cMismatch.Cell(1,3).Value = "SourceChildUrl";
+                cMismatch.Cell(1,4).Value = "TargetChildUrl";
+                cMismatch.Cell(1,5).Value = "FieldName";
+                cMismatch.Cell(1,6).Value = "SourceValue";
+                cMismatch.Cell(1,7).Value = "TargetValue";
+                int cr = 2;
+                foreach (var mm in child.Mismatches)
+                {
+                    cMismatch.Cell(cr,1).Value = mm.ParentId.ToString();
+                    cMismatch.Cell(cr,2).Value = mm.ChildId.ToString();
+                    cMismatch.Cell(cr,3).Value = BuildRecordUrl(sourceEnvUrl, child.ChildEntityLogicalName, mm.ChildId);
+                    cMismatch.Cell(cr,4).Value = BuildRecordUrl(targetEnvUrl, child.ChildEntityLogicalName, mm.ChildId);
+                    cMismatch.Cell(cr,5).Value = mm.FieldName;
+                    cMismatch.Cell(cr,6).Value = Truncate(mm.SourceValue?.ToString());
+                    cMismatch.Cell(cr,7).Value = Truncate(mm.TargetValue?.ToString());
+                    cr++;
+                }
+                cMismatch.Columns().AdjustToContents();
+            }
+        }
+
+        using var ms = new System.IO.MemoryStream();
+        wb.SaveAs(ms);
+        return ms.ToArray();
+    }
+
+    // Build combined workbook for multiple entities (list mode) with prefixed sheet names per entity
+    private static byte[] BuildCombinedExcel(List<(string EntityLogicalName, DiffReport Report)> results, string sourceEnvUrl, string targetEnvUrl, DateTime utcNow)
+    {
+        using var wb = new XLWorkbook();
+        // Global summary sheet
+        var summary = wb.Worksheets.Add("Summary");
+        summary.Cell(1,1).Value = "Entity";
+        summary.Cell(1,2).Value = "ComparedFields";
+        summary.Cell(1,3).Value = "MatchingRecords";
+        summary.Cell(1,4).Value = "Mismatches";
+        summary.Cell(1,5).Value = "OnlyInSource";
+        summary.Cell(1,6).Value = "OnlyInTarget";
+        summary.Cell(1,7).Value = "Notes";
+        int sr = 2;
+        foreach (var item in results)
+        {
+            summary.Cell(sr,1).Value = item.EntityLogicalName;
+            summary.Cell(sr,2).Value = string.Join(',', item.Report.ComparedFields);
+            summary.Cell(sr,3).Value = item.Report.MatchingRecordIds.Count;
+            summary.Cell(sr,4).Value = item.Report.Mismatches.Count;
+            summary.Cell(sr,5).Value = item.Report.OnlyInSource.Count;
+            summary.Cell(sr,6).Value = item.Report.OnlyInTarget.Count;
+            summary.Cell(sr,7).Value = item.Report.Notes;
+            sr++;
+        }
+        summary.Columns().AdjustToContents();
+
+        // Per-entity detailed sheets (similar to BuildExcel but prefixed)
+        foreach (var item in results)
+        {
+            var entity = item.EntityLogicalName;
+            var report = item.Report;
+            string prefix = entity + "_"; // sheet name prefix
+            // Matching records
+            var matchWs = wb.Worksheets.Add(prefix + "MatchingRecords");
+            matchWs.Cell(1,1).Value = "Entity";
+            matchWs.Cell(1,2).Value = "RecordId";
+            matchWs.Cell(1,3).Value = "SourceRecordUrl";
+            matchWs.Cell(1,4).Value = "TargetRecordUrl";
+            for (int i=0;i<report.MatchingRecordIds.Count;i++)
+            {
+                var id = report.MatchingRecordIds[i];
+                matchWs.Cell(i+2,1).Value = entity;
+                matchWs.Cell(i+2,2).Value = id.ToString();
+                matchWs.Cell(i+2,3).Value = sourceEnvUrl.TrimEnd('/') + $"/main.aspx?etn={entity}&id={id}&pagetype=entityrecord";
+                matchWs.Cell(i+2,4).Value = targetEnvUrl.TrimEnd('/') + $"/main.aspx?etn={entity}&id={id}&pagetype=entityrecord";
+            }
+            matchWs.Columns().AdjustToContents();
+
+            var mismatchWs = wb.Worksheets.Add(prefix + "Mismatches");
+            mismatchWs.Cell(1,1).Value = "Entity";
+            mismatchWs.Cell(1,2).Value = "RecordId";
+            mismatchWs.Cell(1,3).Value = "SourceRecordUrl";
+            mismatchWs.Cell(1,4).Value = "TargetRecordUrl";
+            mismatchWs.Cell(1,5).Value = "FieldName";
+            mismatchWs.Cell(1,6).Value = "SourceValue";
+            mismatchWs.Cell(1,7).Value = "TargetValue";
+            int r = 2;
+            foreach (var mm in report.Mismatches)
+            {
+                mismatchWs.Cell(r,1).Value = entity;
+                mismatchWs.Cell(r,2).Value = mm.RecordId.ToString();
+                mismatchWs.Cell(r,3).Value = sourceEnvUrl.TrimEnd('/') + $"/main.aspx?etn={entity}&id={mm.RecordId}&pagetype=entityrecord";
+                mismatchWs.Cell(r,4).Value = targetEnvUrl.TrimEnd('/') + $"/main.aspx?etn={entity}&id={mm.RecordId}&pagetype=entityrecord";
+                mismatchWs.Cell(r,5).Value = mm.FieldName;
+                mismatchWs.Cell(r,6).Value = mm.SourceValue?.ToString();
+                mismatchWs.Cell(r,7).Value = mm.TargetValue?.ToString();
+                r++;
+            }
+            mismatchWs.Columns().AdjustToContents();
+
+            void WriteRecordList(string sheetSuffix, List<Dictionary<string, object?>> records, bool isSource)
+            {
+                var ws = wb.Worksheets.Add(prefix + sheetSuffix);
+                ws.Cell(1,1).Value = "Entity";
+                ws.Cell(1,2).Value = "RecordId";
+                ws.Cell(1,3).Value = isSource ? "SourceRecordUrl" : "TargetRecordUrl";
+                string pk = entity + "id";
+                int row = 2;
+                foreach (var rec in records)
+                {
+                    if (rec.TryGetValue(pk, out var idVal) && Guid.TryParse(idVal?.ToString(), out var gid))
+                    {
+                        ws.Cell(row,1).Value = entity;
+                        ws.Cell(row,2).Value = gid.ToString();
+                        ws.Cell(row,3).Value = (isSource?sourceEnvUrl:targetEnvUrl).TrimEnd('/') + $"/main.aspx?etn={entity}&id={gid}&pagetype=entityrecord";
+                        row++;
+                    }
+                }
+                ws.Columns().AdjustToContents();
+            }
+            if (report.OnlyInSource.Count>0) WriteRecordList("OnlyInSource", report.OnlyInSource, true);
+            if (report.OnlyInTarget.Count>0) WriteRecordList("OnlyInTarget", report.OnlyInTarget, false);
+        }
+
+        using var ms = new System.IO.MemoryStream();
+        wb.SaveAs(ms);
+        return ms.ToArray();
     }
 
     // Discover one-to-many relationships for the parent entity and populate SubgridRelationships if empty
@@ -628,7 +938,18 @@ public class ConfigurationComparisionFunction
         if (string.IsNullOrWhiteSpace(request.EntityLogicalName)) return;
         try
         {
-            _logger.LogInformation("[{CorrelationId}] Auto-discovering subgrid relationships for Entity={Entity}", correlationId, request.EntityLogicalName);
+            _logger.LogInformation("[{CorrelationId}] Auto-discovering subgrid relationships from forms for Entity={Entity}", correlationId, request.EntityLogicalName);
+
+            // Step 1: Get set of relationship schema names actually used in subgrid controls on active forms
+            var relationshipSchemaNames = await ExtractSubgridRelationshipSchemaNamesFromFormsAsync(request.SourceEnvUrl, request.EntityLogicalName, sourceToken, correlationId);
+            if (relationshipSchemaNames.Count == 0)
+            {
+                _logger.LogInformation("[{CorrelationId}] No subgrid controls found on forms for Entity={Entity}; skipping child comparison", correlationId, request.EntityLogicalName);
+                return;
+            }
+            _logger.LogInformation("[{CorrelationId}] Form subgrid relationship schema names Count={Count} Names={Names}", correlationId, relationshipSchemaNames.Count, string.Join(',', relationshipSchemaNames));
+
+            // Step 2: Retrieve one-to-many relationship metadata and filter to only those used on forms
             using var client = new HttpClient();
             client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", sourceToken);
             client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
@@ -647,27 +968,91 @@ public class ConfigurationComparisionFunction
             {
                 foreach (var rel in arr.EnumerateArray())
                 {
+                    string schemaName = rel.TryGetProperty("SchemaName", out var sn) ? sn.GetString() ?? string.Empty : string.Empty;
+                    if (string.IsNullOrWhiteSpace(schemaName)) continue;
+                    // Only retain relationships whose schema name appears in a subgrid control
+                    if (!relationshipSchemaNames.Contains(schemaName, StringComparer.OrdinalIgnoreCase)) continue;
                     string referencingEntity = rel.TryGetProperty("ReferencingEntity", out var re) ? re.GetString() ?? string.Empty : string.Empty;
                     string referencingAttribute = rel.TryGetProperty("ReferencingAttribute", out var ra) ? ra.GetString() ?? string.Empty : string.Empty;
                     if (string.IsNullOrWhiteSpace(referencingEntity) || string.IsNullOrWhiteSpace(referencingAttribute)) continue;
-                    if (referencingEntity.StartsWith("msdyn_", StringComparison.OrdinalIgnoreCase)) continue;
-                    var relReq = new SubgridRelationRequest
+                    if (referencingEntity.StartsWith("msdyn_", StringComparison.OrdinalIgnoreCase)) continue; // skip large msdyn children
+                    list.Add(new SubgridRelationRequest
                     {
                         ChildEntityLogicalName = referencingEntity,
                         ChildParentFieldLogicalName = referencingAttribute,
                         OnlyActiveChildren = true
-                    };
-                    list.Add(relReq);
+                    });
                 }
             }
-            request.SubgridRelationships = list.GroupBy(l => (l.ChildEntityLogicalName.ToLowerInvariant(), l.ChildParentFieldLogicalName.ToLowerInvariant()))
+            request.SubgridRelationships = list
+                .GroupBy(l => (l.ChildEntityLogicalName.ToLowerInvariant(), l.ChildParentFieldLogicalName.ToLowerInvariant()))
                 .Select(g => g.First()).ToList();
-            _logger.LogInformation("[{CorrelationId}] Auto-discovered SubgridRelationships Count={Count}", correlationId, request.SubgridRelationships.Count);
+            _logger.LogInformation("[{CorrelationId}] Auto-discovered form-based SubgridRelationships Count={Count}", correlationId, request.SubgridRelationships.Count);
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "[{CorrelationId}] Auto-discovery of subgrids failed", correlationId);
         }
+    }
+
+    // Extract relationship schema names referenced by subgrid controls in main forms for given entity
+    private async Task<List<string>> ExtractSubgridRelationshipSchemaNamesFromFormsAsync(string envUrl, string entityLogicalName, string accessToken, Guid correlationId)
+    {
+        var result = new List<string>();
+        try
+        {
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+            client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
+            // systemform type 2 = main form. objecttypecode filter by logical name.
+            // We only need formxml column.
+            string url = envUrl.TrimEnd('/') + $"/api/data/v9.2/systemforms?$select=formxml&$filter=objecttypecode eq '{entityLogicalName}' and type eq 2";
+            using var resp = await client.GetAsync(url);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var body = await resp.Content.ReadAsStringAsync();
+                _logger.LogDebug("[{CorrelationId}] systemforms query failed status={Status} snippet={Snippet}", correlationId, resp.StatusCode, body.Length > 180 ? body[..180] : body);
+                return result;
+            }
+            using var stream = await resp.Content.ReadAsStreamAsync();
+            using var doc = await JsonDocument.ParseAsync(stream);
+            if (!doc.RootElement.TryGetProperty("value", out var arr)) return result;
+            foreach (var form in arr.EnumerateArray())
+            {
+                var formXml = form.TryGetProperty("formxml", out var fx) ? fx.GetString() : null;
+                if (string.IsNullOrWhiteSpace(formXml)) continue;
+                try
+                {
+                    var xdoc = XDocument.Parse(formXml);
+                    // Subgrid controls typically have <control ... controltype="subgrid" ...> or type="subgrid". Relationship name stored in relationshipname attribute or parameter node.
+                    var controls = xdoc.Descendants().Where(e => string.Equals(e.Name.LocalName, "control", StringComparison.OrdinalIgnoreCase));
+                    foreach (var c in controls)
+                    {
+                        var typeAttr = c.Attribute("controltype") ?? c.Attribute("type");
+                        if (typeAttr == null) continue;
+                        if (!string.Equals(typeAttr.Value, "subgrid", StringComparison.OrdinalIgnoreCase)) continue;
+                        var relAttr = c.Attribute("relationshipname");
+                        if (relAttr != null && !string.IsNullOrWhiteSpace(relAttr.Value))
+                        {
+                            result.Add(relAttr.Value.Trim());
+                            continue;
+                        }
+                        // Sometimes relationship name nested inside parameters node <parameters><relationshipname>...</relationshipname></parameters>
+                        var relParam = c.Descendants().FirstOrDefault(d => string.Equals(d.Name.LocalName, "relationshipname", StringComparison.OrdinalIgnoreCase));
+                        if (relParam != null && !string.IsNullOrWhiteSpace(relParam.Value)) result.Add(relParam.Value.Trim());
+                    }
+                }
+                catch (Exception xmlEx)
+                {
+                    _logger.LogDebug(xmlEx, "[{CorrelationId}] Failed parsing form XML for entity={Entity}", correlationId, entityLogicalName);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "[{CorrelationId}] ExtractSubgridRelationshipSchemaNamesFromFormsAsync failed entity={Entity}", correlationId, entityLogicalName);
+        }
+        return result.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
 
     // Populate childFields (if empty) with mash_ intersection and validate parent lookup field existence via metadata
@@ -831,7 +1216,7 @@ public class ConfigurationComparisionFunction
         var client = new HttpClient();
         client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
         client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
-        string url = envUrl.TrimEnd('/') + $"/api/data/v9.2/EntityDefinitions(LogicalName='{entityLogicalName}')/Attributes?$select=LogicalName";
+        string? url = envUrl.TrimEnd('/') + $"/api/data/v9.2/EntityDefinitions(LogicalName='{entityLogicalName}')/Attributes?$select=LogicalName";
         var result = new List<string>();
         try
         {
@@ -872,7 +1257,16 @@ public class ConfigurationComparisionFunction
         if (!string.IsNullOrWhiteSpace(primaryNameAttribute)) selectFields.Add(primaryNameAttribute);
         selectFields.AddRange(fields);
         selectFields = selectFields.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase).Where(s => s.Length < 129).ToList();
-        string entitySetName = entityLogicalName + "s"; // TODO: replace with real EntitySetName lookup if needed
+        // Resolve real entity set name from metadata to avoid 404 due to incorrect naive pluralization
+        string entitySetName = await GetEntitySetNameAsync(envUrl, entityLogicalName, accessToken) ?? (entityLogicalName + "s");
+        if (entitySetName == entityLogicalName + "s")
+        {
+            logger.LogDebug("[{CorrelationId}] Using fallback pluralized entity set name '{EntitySetName}' for entity '{EntityLogicalName}'", correlationId, entitySetName, entityLogicalName);
+        }
+        else
+        {
+            logger.LogDebug("[{CorrelationId}] Resolved entity set name '{EntitySetName}' for entity '{EntityLogicalName}'", correlationId, entitySetName, entityLogicalName);
+        }
         string baseUrl = envUrl.TrimEnd('/') + $"/api/data/v9.2/{entitySetName}";
         string filter = onlyActive ? "&$filter=statecode eq 0" : string.Empty;
 
@@ -883,7 +1277,7 @@ public class ConfigurationComparisionFunction
             attempt++;
             bool restartRequested = false;
             string selectClause = string.Join(',', selectFields);
-            string url = baseUrl + "?$select=" + selectClause + filter;
+            string? url = baseUrl + "?$select=" + selectClause + filter;
             logger.LogDebug("[{CorrelationId}] Fetch attempt {Attempt} URL length={UrlLength} Fields={FieldCount} Select={Select}", correlationId, attempt, url.Length, selectFields.Count, selectClause);
             try
             {
@@ -1013,16 +1407,37 @@ public class ConfigurationComparisionFunction
 
     private static bool AreEqual(object? a, object? b)
     {
-        // Treat missing or empty string values as null for comparison
+        // Normalize null / empty
         if (a is string sa && string.IsNullOrWhiteSpace(sa)) a = null;
         if (b is string sb && string.IsNullOrWhiteSpace(sb)) b = null;
         if (a == null && b == null) return true;
         if (a == null || b == null) return false;
+
+        // Guid comparison
         if (Guid.TryParse(a.ToString(), out var ga) && Guid.TryParse(b.ToString(), out var gb)) return ga.Equals(gb);
+
+        // String normalization: trim and collapse internal whitespace; case-insensitive
+        static string NormalizeString(string s)
+        {
+            // Trim and collapse multiple spaces to single space
+            var trimmed = s.Trim();
+            if (trimmed.Length == 0) return string.Empty;
+            var parts = trimmed.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            return string.Join(' ', parts).ToLowerInvariant();
+        }
+
+        if (a is string || b is string)
+        {
+            var na = NormalizeString(a.ToString() ?? string.Empty);
+            var nb = NormalizeString(b.ToString() ?? string.Empty);
+            return na == nb;
+        }
+
+        // Fallback to case-insensitive string comparison of ToString values
         return string.Equals(a.ToString(), b.ToString(), StringComparison.OrdinalIgnoreCase);
     }
 
-    private static byte[] BuildExcel(DiffReport report, string entityLogicalName)
+    private static byte[] BuildExcel(DiffReport report, string entityLogicalName, string sourceEnvUrl, string targetEnvUrl, DateTime comparisonTimestampUtc)
     {
         const int ExcelMaxCellLength = 32767;
         string Truncate(string? v)
@@ -1032,34 +1447,76 @@ public class ConfigurationComparisionFunction
             return v.Substring(0, ExcelMaxCellLength - 15) + "...(truncated)";
         }
 
+        // Helper to construct a direct model-driven app record URL (generic main.aspx link)
+        string BuildRecordUrl(string envUrl, string etn, Guid id)
+        {
+            if (string.IsNullOrWhiteSpace(envUrl) || string.IsNullOrWhiteSpace(etn) || id == Guid.Empty) return string.Empty;
+            // Using pagetype=entityrecord ensures navigation to record form; GUID without braces works.
+            return envUrl.TrimEnd('/') + $"/main.aspx?etn={etn}&id={id}&pagetype=entityrecord";
+        }
+
         using var wb = new XLWorkbook();
+        // Summary sheet: single header row (requested columns) and single value row
         var summary = wb.Worksheets.Add("Summary");
-        summary.Cell(1, 1).Value = "Entity"; summary.Cell(1, 2).Value = entityLogicalName;
-        summary.Cell(2, 1).Value = "Compared Fields"; summary.Cell(2, 2).Value = Truncate(string.Join(',', report.ComparedFields));
-        summary.Cell(3, 1).Value = "Matching Records"; summary.Cell(3, 2).Value = report.MatchingRecordIds.Count;
-        summary.Cell(4, 1).Value = "Mismatches"; summary.Cell(4, 2).Value = report.Mismatches.Count; // each field mismatch already listed individually
-        summary.Cell(5, 1).Value = "Only In Source"; summary.Cell(5, 2).Value = report.OnlyInSource.Count;
-        summary.Cell(6, 1).Value = "Only In Target"; summary.Cell(6, 2).Value = report.OnlyInTarget.Count;
-        summary.Cell(7, 1).Value = "Notes"; summary.Cell(7, 2).Value = Truncate(report.Notes);
+        summary.Cell(1, 1).Value = "Source Env";
+        summary.Cell(1, 2).Value = "Target Env";
+        summary.Cell(1, 3).Value = "Comparission Date and Time"; // original spelling kept
+        summary.Cell(1, 4).Value = "Entity";
+        summary.Cell(1, 5).Value = "Compared Fields";
+        summary.Cell(1, 6).Value = "Matching Records";
+        summary.Cell(1, 7).Value = "Mismatches";
+        summary.Cell(1, 8).Value = "Only In Source";
+        summary.Cell(1, 9).Value = "Only In Target";
+        summary.Cell(1, 10).Value = "Notes";
+        summary.Cell(2, 1).Value = sourceEnvUrl;
+        summary.Cell(2, 2).Value = targetEnvUrl;
+        summary.Cell(2, 3).Value = comparisonTimestampUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+        summary.Cell(2, 4).Value = entityLogicalName;
+        summary.Cell(2, 5).Value = Truncate(string.Join(',', report.ComparedFields));
+        summary.Cell(2, 6).Value = report.MatchingRecordIds.Count;
+        summary.Cell(2, 7).Value = report.Mismatches.Count;
+        summary.Cell(2, 8).Value = report.OnlyInSource.Count;
+        summary.Cell(2, 9).Value = report.OnlyInTarget.Count;
+        summary.Cell(2, 10).Value = Truncate(report.Notes);
         summary.Columns().AdjustToContents();
 
         var matchWs = wb.Worksheets.Add("MatchingRecords");
-        matchWs.Cell(1, 1).Value = "RecordId";
-        for (int i = 0; i < report.MatchingRecordIds.Count; i++) matchWs.Cell(i + 2, 1).Value = report.MatchingRecordIds[i].ToString();
+        matchWs.Cell(1, 1).Value = "Entity";
+        matchWs.Cell(1, 2).Value = "RecordId";
+        matchWs.Cell(1, 3).Value = "SourceRecordUrl";
+        matchWs.Cell(1, 4).Value = "TargetRecordUrl";
+        for (int i = 0; i < report.MatchingRecordIds.Count; i++)
+        {
+            var id = report.MatchingRecordIds[i];
+            matchWs.Cell(i + 2, 1).Value = entityLogicalName;
+            matchWs.Cell(i + 2, 2).Value = id.ToString();
+            matchWs.Cell(i + 2, 3).Value = BuildRecordUrl(sourceEnvUrl, entityLogicalName, id);
+            matchWs.Cell(i + 2, 4).Value = BuildRecordUrl(targetEnvUrl, entityLogicalName, id);
+        }
         matchWs.Columns().AdjustToContents();
 
         var mismatchWs = wb.Worksheets.Add("Mismatches");
-        mismatchWs.Cell(1, 1).Value = "RecordId";
-        mismatchWs.Cell(1, 2).Value = "FieldName";
-        mismatchWs.Cell(1, 3).Value = "SourceValue";
-        mismatchWs.Cell(1, 4).Value = "TargetValue";
+        mismatchWs.Cell(1, 1).Value = "Entity";
+        mismatchWs.Cell(1, 2).Value = "RecordId";
+        mismatchWs.Cell(1, 3).Value = "SourceRecordUrl";
+        mismatchWs.Cell(1, 4).Value = "TargetRecordUrl";
+        mismatchWs.Cell(1, 5).Value = "FieldNames";
+        mismatchWs.Cell(1, 6).Value = "SourceValues";
+        mismatchWs.Cell(1, 7).Value = "TargetValues";
         int r = 2;
-        foreach (var mm in report.Mismatches)
+        foreach (var grp in report.Mismatches.GroupBy(m => m.RecordId))
         {
-            mismatchWs.Cell(r, 1).Value = mm.RecordId.ToString();
-            mismatchWs.Cell(r, 2).Value = mm.FieldName;
-            mismatchWs.Cell(r, 3).Value = Truncate(mm.SourceValue?.ToString());
-            mismatchWs.Cell(r, 4).Value = Truncate(mm.TargetValue?.ToString());
+            var recordId = grp.Key;
+            var fieldNames = string.Join(',', grp.Select(g => g.FieldName));
+            var sourceVals = string.Join(" | ", grp.Select(g => Truncate(g.SourceValue?.ToString())));
+            var targetVals = string.Join(" | ", grp.Select(g => Truncate(g.TargetValue?.ToString())));
+            mismatchWs.Cell(r, 1).Value = entityLogicalName;
+            mismatchWs.Cell(r, 2).Value = recordId.ToString();
+            mismatchWs.Cell(r, 3).Value = BuildRecordUrl(sourceEnvUrl, entityLogicalName, recordId);
+            mismatchWs.Cell(r, 4).Value = BuildRecordUrl(targetEnvUrl, entityLogicalName, recordId);
+            mismatchWs.Cell(r, 5).Value = Truncate(fieldNames);
+            mismatchWs.Cell(r, 6).Value = Truncate(sourceVals);
+            mismatchWs.Cell(r, 7).Value = Truncate(targetVals);
             r++;
         }
         mismatchWs.Columns().AdjustToContents();
@@ -1067,24 +1524,30 @@ public class ConfigurationComparisionFunction
         // Removed separate MultiFieldMismatches worksheet per request; individual field mismatches already captured above.
 
         // Write OnlyInSource / OnlyInTarget sheets with just RecordId column as requested
-        void WriteRecordIdOnly(string sheetName, List<Dictionary<string, object?>> records)
+        void WriteRecordIdOnly(string sheetName, List<Dictionary<string, object?>> records, bool isSource)
         {
             var ws = wb.Worksheets.Add(sheetName);
-            ws.Cell(1, 1).Value = "RecordId";
+            ws.Cell(1, 1).Value = "Entity";
+            ws.Cell(1, 2).Value = "RecordId";
+            ws.Cell(1, 3).Value = isSource ? "SourceRecordUrl" : "TargetRecordUrl";
             int row = 2;
             string pk = entityLogicalName + "id";
+            var distinctIds = new HashSet<Guid>();
             foreach (var rec in records)
             {
-                if (rec.TryGetValue(pk, out var idVal))
+                if (rec.TryGetValue(pk, out var idVal) && Guid.TryParse(idVal?.ToString(), out var gid))
                 {
-                    ws.Cell(row, 1).Value = idVal?.ToString();
+                    if (!distinctIds.Add(gid)) continue; // skip duplicates
+                    ws.Cell(row, 1).Value = entityLogicalName;
+                    ws.Cell(row, 2).Value = gid.ToString();
+                    ws.Cell(row, 3).Value = BuildRecordUrl(isSource ? sourceEnvUrl : targetEnvUrl, entityLogicalName, gid);
                     row++;
                 }
             }
             ws.Columns().AdjustToContents();
         }
-        WriteRecordIdOnly("OnlyInSource", report.OnlyInSource);
-        WriteRecordIdOnly("OnlyInTarget", report.OnlyInTarget);
+        WriteRecordIdOnly("OnlyInSource", report.OnlyInSource, true);
+        WriteRecordIdOnly("OnlyInTarget", report.OnlyInTarget, false);
 
         // Child diffs (unchanged)
         foreach (var child in report.ChildDiffs.Values)
@@ -1101,47 +1564,62 @@ public class ConfigurationComparisionFunction
             var childMismatchWs = wb.Worksheets.Add($"Child_{child.ChildEntityLogicalName}_Mismatches".Replace('-', '_'));
             childMismatchWs.Cell(1, 1).Value = "ParentId";
             childMismatchWs.Cell(1, 2).Value = "ChildId";
-            childMismatchWs.Cell(1, 3).Value = "FieldName";
-            childMismatchWs.Cell(1, 4).Value = "SourceValue";
-            childMismatchWs.Cell(1, 5).Value = "TargetValue";
+            childMismatchWs.Cell(1, 3).Value = "SourceChildUrl";
+            childMismatchWs.Cell(1, 4).Value = "TargetChildUrl";
+            childMismatchWs.Cell(1, 5).Value = "FieldName";
+            childMismatchWs.Cell(1, 6).Value = "SourceValue";
+            childMismatchWs.Cell(1, 7).Value = "TargetValue";
             int cr = 2;
             foreach (var mm in child.Mismatches)
             {
                 childMismatchWs.Cell(cr, 1).Value = mm.ParentId.ToString();
                 childMismatchWs.Cell(cr, 2).Value = mm.ChildId.ToString();
-                childMismatchWs.Cell(cr, 3).Value = mm.FieldName;
-                childMismatchWs.Cell(cr, 4).Value = Truncate(mm.SourceValue?.ToString());
-                childMismatchWs.Cell(cr, 5).Value = Truncate(mm.TargetValue?.ToString());
+                childMismatchWs.Cell(cr, 3).Value = BuildRecordUrl(sourceEnvUrl, child.ChildEntityLogicalName, mm.ChildId);
+                childMismatchWs.Cell(cr, 4).Value = BuildRecordUrl(targetEnvUrl, child.ChildEntityLogicalName, mm.ChildId);
+                childMismatchWs.Cell(cr, 5).Value = mm.FieldName;
+                childMismatchWs.Cell(cr, 6).Value = Truncate(mm.SourceValue?.ToString());
+                childMismatchWs.Cell(cr, 7).Value = Truncate(mm.TargetValue?.ToString());
                 cr++;
             }
             childMismatchWs.Columns().AdjustToContents();
 
-            void WriteChildRecordList(string sheetBase, Dictionary<Guid, List<Dictionary<string, object?>>> dict)
+            void WriteChildRecordList(string sheetBase, Dictionary<Guid, List<Dictionary<string, object?>>> dict, bool isSource)
             {
                 var ws = wb.Worksheets.Add($"Child_{child.ChildEntityLogicalName}_{sheetBase}".Replace('-', '_'));
                 ws.Cell(1, 1).Value = "ParentId";
                 ws.Cell(1, 2).Value = "ChildId";
-                for (int i = 0; i < child.ComparedChildFields.Count; i++) ws.Cell(1, i + 3).Value = child.ComparedChildFields[i];
+                ws.Cell(1, 3).Value = isSource ? "SourceChildUrl" : "TargetChildUrl";
+                for (int i = 0; i < child.ComparedChildFields.Count; i++) ws.Cell(1, i + 4).Value = child.ComparedChildFields[i];
                 int row = 2;
                 foreach (var parentPair in dict)
                 {
                     foreach (var rec in parentPair.Value)
                     {
                         rec.TryGetValue(child.ChildEntityLogicalName + "id", out var cid);
+                        Guid gid = Guid.TryParse(cid?.ToString(), out var tmp) ? tmp : Guid.Empty;
                         ws.Cell(row, 1).Value = parentPair.Key.ToString();
-                        ws.Cell(row, 2).Value = cid?.ToString();
+                        var cidCell = ws.Cell(row, 2);
+                        cidCell.Value = gid == Guid.Empty ? cid?.ToString() : gid.ToString();
+                        if (gid != Guid.Empty)
+                        {
+                            // Link cell shows GUID hyperlinked
+                            var url = BuildRecordUrl(isSource ? sourceEnvUrl : targetEnvUrl, child.ChildEntityLogicalName, gid);
+                            var linkCell = ws.Cell(row, 3);
+                            linkCell.Value = url;
+                            linkCell.SetHyperlink(new XLHyperlink(url));
+                        }
                         for (int i = 0; i < child.ComparedChildFields.Count; i++)
                         {
                             rec.TryGetValue(child.ComparedChildFields[i], out var val);
-                            ws.Cell(row, i + 3).Value = Truncate(val?.ToString());
+                            ws.Cell(row, i + 4).Value = Truncate(val?.ToString());
                         }
                         row++;
                     }
                 }
                 ws.Columns().AdjustToContents();
             }
-            if (child.OnlyInSourceByParent.Count > 0) WriteChildRecordList("OnlyInSource", child.OnlyInSourceByParent);
-            if (child.OnlyInTargetByParent.Count > 0) WriteChildRecordList("OnlyInTarget", child.OnlyInTargetByParent);
+            if (child.OnlyInSourceByParent.Count > 0) WriteChildRecordList("OnlyInSource", child.OnlyInSourceByParent, true);
+            if (child.OnlyInTargetByParent.Count > 0) WriteChildRecordList("OnlyInTarget", child.OnlyInTargetByParent, false);
         }
 
         using var ms = new System.IO.MemoryStream();
@@ -1149,10 +1627,30 @@ public class ConfigurationComparisionFunction
         return ms.ToArray();
     }
 
-    private static string GenerateBlobName(string entityLogicalName)
+    private static string ExtractEnvShortName(string envUrl)
     {
+        try
+        {
+            var uri = new Uri(envUrl);
+            var host = uri.Host; // e.g. mash.crm.dynamics.com or mashppe.crm.dynamics.com
+            var firstDot = host.IndexOf('.', StringComparison.OrdinalIgnoreCase);
+            if (firstDot > 0) return host.Substring(0, firstDot);
+            return host; // fallback
+        }
+        catch { return "env"; }
+    }
+
+    private static string GenerateBlobName(string sourceEnvUrl, string targetEnvUrl, string entityLogicalName, bool isCombined = false)
+    {
+        var src = ExtractEnvShortName(sourceEnvUrl);
+        var tgt = ExtractEnvShortName(targetEnvUrl);
+        var ts = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
+        if (isCombined)
+        {
+            return $"comparison-{src}-vs-{tgt}-multi-{ts}.xlsx";
+        }
         var safeEntity = new string(entityLogicalName.Select(ch => char.IsLetterOrDigit(ch) ? ch : '_').ToArray());
-        return $"comparison-{safeEntity}-{DateTime.UtcNow:yyyyMMddHHmmss}.xlsx";
+        return $"comparison-{src}-vs-{tgt}-{safeEntity}-{ts}.xlsx";
     }
 
     private static async Task<string> UploadExcelWithFlexibleAuthAsync(byte[] bytes, string blobName, string? accountUrl = null, string? containerName = null, TokenCredential? credential = null, string? connectionString = null, string? containerSasUrl = null)
@@ -1239,7 +1737,7 @@ public class ConfigurationComparisionFunction
             attempt++;
             bool restartRequested = false;
             string selectClause = string.Join(',', selectFields);
-            string url = baseUrl + "?$select=" + selectClause + filter;
+            string? url = baseUrl + "?$select=" + selectClause + filter;
             logger.LogDebug("[{CorrelationId}] Child fetch attempt={Attempt} Entity={ChildEntity} FieldCount={FieldCount} URLLength={Len}", correlationId, attempt, childEntityLogicalName, selectFields.Count, url.Length);
             try
             {
