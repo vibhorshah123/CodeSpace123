@@ -276,22 +276,13 @@ class ExcelGenerator:
         if comparison_result['mismatches']:
             self._create_field_mismatches_sheet(wb, comparison_result, source_env_name, target_env_name)
         
-        # Create GUID Mismatches sheet
-        if comparison_result.get('guid_mismatches'):
-            self._create_guid_mismatches_sheet(wb, comparison_result, source_env_name, target_env_name)
-        
-        # Create Name Matches with Different IDs sheet
-        if comparison_result.get('name_matches_with_different_ids'):
-            self._create_name_id_mismatch_sheet(wb, comparison_result, source_env_name, target_env_name)
+        # Create Name Matched Records sheet
+        if comparison_result.get('name_matched_records'):
+            self._create_name_matched_records_sheet(wb, comparison_result, source_env_name, target_env_name)
         
         # Create Matching Records sheet
         if comparison_result['matching_records']:
             self._create_matching_records_sheet(wb, comparison_result)
-        
-        # Create sheets for related entity comparisons
-        if comparison_result.get('child_comparisons'):
-            for child_entity, child_data in comparison_result['child_comparisons'].items():
-                self._create_child_comparison_sheet(wb, child_entity, child_data)
         
         # Save workbook
         wb.save(output_file)
@@ -301,13 +292,22 @@ class ExcelGenerator:
         """Create data comparison summary sheet"""
         ws = wb.create_sheet("Summary", 0)
         
+        # Determine match mode for title
+        match_mode = comparison_result.get('match_mode', 'guid').upper()
+        
         # Title
-        ws['A1'] = "Data Comparison Report (GUID-Based)"
+        ws['A1'] = f"Data Comparison Report ({match_mode} Matching)"
         ws['A1'].font = Font(bold=True, size=16)
         ws.merge_cells('A1:B1')
         
         row = 2
-        ws[f'A{row}'] = "Note: Comparison is based on GUID matching. System fields (modifiedon, createdby, ownerid, etc.) are excluded."
+        if match_mode == "GUID":
+            note = "Comparison is based on GUID matching. System fields (modifiedon, createdby, ownerid, etc.) are excluded."
+        elif match_mode == "NAME":
+            note = "Comparison is based on Primary Name matching. System fields and primary keys are excluded."
+        else:  # BOTH
+            note = "Comparison uses GUID first, then Primary Name for unmatched records. System fields excluded."
+        ws[f'A{row}'] = f"Note: {note}"
         ws[f'A{row}'].font = Font(italic=True, size=9)
         ws.merge_cells(f'A{row}:B{row}')
         
@@ -330,6 +330,12 @@ class ExcelGenerator:
         ws[f'A{row}'].font = Font(bold=True)
         
         row += 1
+        ws[f'A{row}'] = "Match Mode:"
+        ws[f'B{row}'] = match_mode
+        ws[f'A{row}'].font = Font(bold=True)
+        ws[f'B{row}'].font = Font(bold=True, color="0066CC")
+        
+        row += 1
         ws[f'A{row}'] = "Report Generated:"
         ws[f'B{row}'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ws[f'A{row}'].font = Font(bold=True)
@@ -345,21 +351,48 @@ class ExcelGenerator:
         ws[f'B{row}'] = "Count"
         self._apply_header_style(ws, row, 2)
         
-        # Statistics rows
+        # Statistics rows - base stats
         source_label = source_env_name if source_env_name else "Source"
         target_label = target_env_name if target_env_name else "Target"
-        unique_mismatch_guids = len(set([m['record_id'] for m in comparison_result['mismatches']])) if comparison_result['mismatches'] else 0
+        unique_mismatch_records = len(set([m['record_id'] for m in comparison_result['mismatches']])) if comparison_result['mismatches'] else 0
+        
         stats = [
             (f"{source_label} Records (Total)", comparison_result['source_record_count'], None),
             (f"{target_label} Records (Total)", comparison_result['target_record_count'], None),
-            (f"GUIDs Only in {source_label}", len(comparison_result['only_in_source']), self.warning_fill),
-            (f"GUIDs Only in {target_label}", len(comparison_result['only_in_target']), self.warning_fill),
-            ("GUIDs with Attribute Mismatches", unique_mismatch_guids, self.info_fill),
-            ("Total Field Mismatches", len(comparison_result['mismatches']), self.info_fill),
-            ("Lookup Field (GUID) Mismatches", len(comparison_result.get('guid_mismatches', [])), self.warning_fill),
-            ("Same Name, Different GUIDs", len(comparison_result.get('name_matches_with_different_ids', [])), self.warning_fill),
-            ("Matching GUIDs (Identical)", len(comparison_result['matching_records']), self.success_fill)
         ]
+        
+        # Match mode specific stats
+        if match_mode == "GUID":
+            stats.extend([
+                (f"GUIDs Only in {source_label}", len(comparison_result['only_in_source']), self.warning_fill),
+                (f"GUIDs Only in {target_label}", len(comparison_result['only_in_target']), self.warning_fill),
+                ("GUIDs with Attribute Mismatches", unique_mismatch_records, self.info_fill),
+                ("Total Field Mismatches", len(comparison_result['mismatches']), self.info_fill),
+                ("Lookup Field (GUID) Mismatches", len(comparison_result.get('guid_mismatches', [])), self.warning_fill),
+                ("Same Name, Different GUIDs", len(comparison_result.get('name_matches_with_different_ids', [])), self.warning_fill),
+                ("Matching GUIDs (Identical)", len(comparison_result['matching_records']), self.success_fill)
+            ])
+        elif match_mode == "NAME":
+            stats.extend([
+                (f"Names Only in {source_label}", len(comparison_result['only_in_source']), self.warning_fill),
+                (f"Names Only in {target_label}", len(comparison_result['only_in_target']), self.warning_fill),
+                ("Names with Attribute Mismatches", unique_mismatch_records, self.info_fill),
+                ("Total Field Mismatches", len(comparison_result['mismatches']), self.info_fill),
+                ("Name Matched (Different GUIDs)", len(comparison_result.get('name_matched_records', [])), self.info_fill),
+                ("Duplicate Names in Source", len(comparison_result.get('duplicate_names_source', [])), self.warning_fill),
+                ("Duplicate Names in Target", len(comparison_result.get('duplicate_names_target', [])), self.warning_fill),
+                ("Matching Names (Identical)", len(comparison_result['matching_records']), self.success_fill)
+            ])
+        else:  # BOTH
+            stats.extend([
+                ("GUID Matched Records", len(comparison_result.get('guid_matched_records', [])), self.success_fill),
+                ("Name Matched (Different GUIDs)", len(comparison_result.get('name_matched_records', [])), self.info_fill),
+                (f"Unmatched in {source_label}", len(comparison_result['only_in_source']), self.warning_fill),
+                (f"Unmatched in {target_label}", len(comparison_result['only_in_target']), self.warning_fill),
+                ("Records with Mismatches", unique_mismatch_records, self.info_fill),
+                ("Total Field Mismatches", len(comparison_result['mismatches']), self.info_fill),
+                ("Total Matching (Identical)", len(comparison_result['matching_records']), self.success_fill)
+            ])
         
         for label, value, fill in stats:
             row += 1
@@ -371,37 +404,18 @@ class ExcelGenerator:
                 ws[f'B{row}'].fill = fill
             ws[f'B{row}'].alignment = Alignment(horizontal='center')
         
-        # Related entities summary
-        if comparison_result.get('child_comparisons'):
-            row += 2
-            ws[f'A{row}'] = "RELATED ENTITIES"
-            ws[f'A{row}'].font = Font(bold=True, size=12)
-            ws.merge_cells(f'A{row}:B{row}')
-            
-            row += 1
-            ws[f'A{row}'] = "Entity"
-            ws[f'B{row}'] = "Records"
-            self._apply_header_style(ws, row, 2)
-            
-            for child_entity, child_data in comparison_result['child_comparisons'].items():
-                row += 1
-                ws[f'A{row}'] = child_entity
-                ws[f'B{row}'] = f"{source_label}: {child_data['source_total']}, {target_label}: {child_data['target_total']}"
-                ws[f'A{row}'].border = self.border
-                ws[f'B{row}'].border = self.border
-        
         self._auto_adjust_columns(ws)
     
     def _create_records_only_in_source_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None):
-        """Create sheet for records only in source"""
+        """Create sheet for records only in source (by primary name)"""
         source_label = source_env_name if source_env_name else "Source"
-        ws = wb.create_sheet(f"GUIDs Only in {source_label}")
+        ws = wb.create_sheet(f"Only in {source_label}")
         
         if not comparison_result['only_in_source']:
             return
         
         # Add title
-        ws['A1'] = f"GUIDs Present in {source_label} but NOT in Target"
+        ws['A1'] = f"Records Present in {source_label} but NOT in Target (Primary Name Matching)"
         ws['A1'].font = Font(bold=True, size=12)
         ws.merge_cells('A1:C1')
         
@@ -409,19 +423,16 @@ class ExcelGenerator:
         first_record = comparison_result['only_in_source'][0]
         fields = [f for f in first_record.keys() if not f.startswith("@")]
         
-        # Ensure primary key is first column
-        pk_field = comparison_result.get('table_name', '') + 'id'
-        if pk_field in fields:
-            fields.remove(pk_field)
-            fields.insert(0, pk_field)
+        # Ensure primary name is first column
+        primary_name_field = comparison_result.get('primary_name_field', 'name')
+        if primary_name_field in fields:
+            fields.remove(primary_name_field)
+            fields.insert(0, primary_name_field)
         
         # Headers (starting at row 3)
         for col, field in enumerate(fields, start=1):
             cell = ws.cell(row=3, column=col)
-            if field == pk_field:
-                cell.value = f"{field} (GUID)"
-            else:
-                cell.value = field
+            cell.value = field
         
         self._apply_header_style(ws, 3, len(fields))
         
@@ -434,22 +445,22 @@ class ExcelGenerator:
                     value = value[:500] + "..."
                 ws.cell(row=row_idx, column=col_idx).value = str(value) if value else ""
                 ws.cell(row=row_idx, column=col_idx).border = self.border
-                # Highlight GUID column
-                if field == pk_field:
+                # Highlight primary name column
+                if field == primary_name_field:
                     ws.cell(row=row_idx, column=col_idx).fill = self.info_fill
         
         self._auto_adjust_columns(ws)
     
     def _create_records_only_in_target_sheet(self, wb, comparison_result: Dict[str, Any], target_env_name: str = None):
-        """Create sheet for records only in target"""
+        """Create sheet for records only in target (by primary name)"""
         target_label = target_env_name if target_env_name else "Target"
-        ws = wb.create_sheet(f"GUIDs Only in {target_label}")
+        ws = wb.create_sheet(f"Only in {target_label}")
         
         if not comparison_result['only_in_target']:
             return
         
         # Add title
-        ws['A1'] = f"GUIDs Present in {target_label} but NOT in Source"
+        ws['A1'] = f"Records Present in {target_label} but NOT in Source (Primary Name Matching)"
         ws['A1'].font = Font(bold=True, size=12)
         ws.merge_cells('A1:C1')
         
@@ -457,19 +468,16 @@ class ExcelGenerator:
         first_record = comparison_result['only_in_target'][0]
         fields = [f for f in first_record.keys() if not f.startswith("@")]
         
-        # Ensure primary key is first column
-        pk_field = comparison_result.get('table_name', '') + 'id'
-        if pk_field in fields:
-            fields.remove(pk_field)
-            fields.insert(0, pk_field)
+        # Ensure primary name is first column
+        primary_name_field = comparison_result.get('primary_name_field', 'name')
+        if primary_name_field in fields:
+            fields.remove(primary_name_field)
+            fields.insert(0, primary_name_field)
         
         # Headers (starting at row 3)
         for col, field in enumerate(fields, start=1):
             cell = ws.cell(row=3, column=col)
-            if field == pk_field:
-                cell.value = f"{field} (GUID)"
-            else:
-                cell.value = field
+            cell.value = field
         
         self._apply_header_style(ws, 3, len(fields))
         
@@ -482,23 +490,23 @@ class ExcelGenerator:
                     value = value[:500] + "..."
                 ws.cell(row=row_idx, column=col_idx).value = str(value) if value else ""
                 ws.cell(row=row_idx, column=col_idx).border = self.border
-                # Highlight GUID column
-                if field == pk_field:
+                # Highlight primary name column
+                if field == primary_name_field:
                     ws.cell(row=row_idx, column=col_idx).fill = self.info_fill
         
         self._auto_adjust_columns(ws)
     
     def _create_field_mismatches_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
-        """Create sheet for field mismatches"""
+        """Create sheet for field mismatches (name-based matching)"""
         ws = wb.create_sheet("Attribute Mismatches")
-        
+
         # Add title
-        ws['A1'] = "Records with Matching GUIDs but Different Attribute Values"
+        ws['A1'] = "Records Matched by Primary Name with Attribute Differences"
         ws['A1'].font = Font(bold=True, size=12)
         ws.merge_cells('A1:F1')
         
         row = 2
-        ws[f'A{row}'] = "Note: System fields (modifiedon, createdby, ownerid, versionnumber, etc.) are excluded from comparison."
+        ws[f'A{row}'] = "Note: System fields are excluded from comparison. Primary keys (GUIDs) are not used for matching."
         ws[f'A{row}'].font = Font(italic=True, size=9)
         ws.merge_cells(f'A{row}:F{row}')
         
@@ -506,7 +514,7 @@ class ExcelGenerator:
         source_label = source_env_name if source_env_name else "Source"
         target_label = target_env_name if target_env_name else "Target"
         row = 4
-        headers = ["Record GUID", "Record Name", "Field Name", f"{source_label} Value", f"{target_label} Value", "Type"]
+        headers = ["Source ID", "Primary Name", "Field Name", f"{source_label} Value", f"{target_label} Value", "Type"]
         for col, header in enumerate(headers, start=1):
             cell = ws.cell(row=row, column=col)
             cell.value = header
@@ -555,16 +563,16 @@ class ExcelGenerator:
         self._auto_adjust_columns(ws)
     
     def _create_matching_records_sheet(self, wb, comparison_result: Dict[str, Any]):
-        """Create sheet for matching records"""
-        ws = wb.create_sheet("Matching GUIDs")
-        
+        """Create sheet for matching records (name-based)"""
+        ws = wb.create_sheet("Matching Records")
+
         # Add title
-        ws['A1'] = "Records with Matching GUIDs and Identical Attribute Values"
+        ws['A1'] = "Records Matched by Primary Name with Identical Attribute Values"
         ws['A1'].font = Font(bold=True, size=12)
         ws.merge_cells('A1:B1')
-        
+
         # Headers (starting at row 3)
-        ws['A3'] = "Record GUID"
+        ws['A3'] = "Source ID"
         ws['A3'].fill = self.success_fill
         ws['A3'].font = Font(bold=True)
         ws['A3'].border = self.border
@@ -664,71 +672,80 @@ class ExcelGenerator:
         
         self._auto_adjust_columns(ws)
     
-    def _create_child_comparison_sheet(self, wb, child_entity: str, child_data: Dict[str, Any]):
-        """Create sheet for related entity comparison"""
-        # Sanitize sheet name (max 31 chars, no special chars)
-        sheet_name = child_entity[:28] + "..." if len(child_entity) > 31 else child_entity
-        sheet_name = sheet_name.replace("/", "_").replace("\\", "_").replace("*", "_")
-        
-        ws = wb.create_sheet(sheet_name)
+    def _create_name_matched_records_sheet(self, wb, comparison_result: Dict[str, Any], source_env_name: str = None, target_env_name: str = None):
+        """Create sheet for records matched by name (with different GUIDs)"""
+        ws = wb.create_sheet("Name Matched Records")
         
         # Title
-        ws['A1'] = f"Related Entity: {child_entity}"
+        ws['A1'] = "Records Matched by Primary Name (Different GUIDs)"
         ws['A1'].font = Font(bold=True, size=12)
-        ws.merge_cells('A1:D1')
+        ws.merge_cells('A1:E1')
         
-        # Summary
+        source_label = source_env_name if source_env_name else "Source"
+        target_label = target_env_name if target_env_name else "Target"
+        
         row = 3
-        ws[f'A{row}'] = "Lookup Field:"
-        ws[f'B{row}'] = child_data['lookup_field']
-        ws[f'A{row}'].font = Font(bold=True)
+        ws[f'A{row}'] = "These records were matched using their primary name field because GUIDs differ between environments."
+        ws[f'A{row}'].font = Font(italic=True)
+        ws.merge_cells(f'A{row}:E{row}')
         
         row += 1
-        ws[f'A{row}'] = "Source Total Records:"
-        ws[f'B{row}'] = child_data['source_total']
-        ws[f'A{row}'].font = Font(bold=True)
+        ws[f'A{row}'] = "This is common in independent environments or after data migrations where GUIDs are regenerated."
+        ws[f'A{row}'].font = Font(italic=True, size=9)
+        ws.merge_cells(f'A{row}:E{row}')
         
-        row += 1
-        ws[f'A{row}'] = "Target Total Records:"
-        ws[f'B{row}'] = child_data['target_total']
-        ws[f'A{row}'].font = Font(bold=True)
+        # Headers
+        row += 2
+        primary_name_field = comparison_result.get('primary_name_field', 'Name')
+        headers = [primary_name_field, f"{source_label} GUID", f"{target_label} GUID", "Has Differences", "Status"]
+        for col, header in enumerate(headers, start=1):
+            cell = ws.cell(row=row, column=col)
+            cell.value = header
         
-        # Differences
-        if child_data.get('differences'):
-            row += 2
-            ws[f'A{row}'] = "Differences by Parent Record"
-            ws[f'A{row}'].font = Font(bold=True, size=11)
-            ws.merge_cells(f'A{row}:D{row}')
-            
+        self._apply_header_style(ws, row, len(headers))
+        
+        # Data
+        name_matched = comparison_result.get('name_matched_records', [])
+        for match in name_matched:
             row += 1
-            headers = ["Parent ID", "Only in Source", "Only in Target", "Status"]
-            for col, header in enumerate(headers, start=1):
+            ws[f'A{row}'] = str(match.get('name', ''))
+            ws[f'B{row}'] = str(match.get('source_id', ''))
+            ws[f'C{row}'] = str(match.get('target_id', ''))
+            has_diff = match.get('has_differences', False)
+            ws[f'D{row}'] = "Yes" if has_diff else "No"
+            ws[f'E{row}'] = "Matched by Name" if not has_diff else "Matched by Name (with attribute differences)"
+            
+            # Apply borders and highlighting
+            for col in range(1, 6):
                 cell = ws.cell(row=row, column=col)
-                cell.value = header
+                cell.border = self.border
             
-            self._apply_header_style(ws, row, len(headers))
-            
-            for diff in child_data['differences']:
-                row += 1
-                ws[f'A{row}'] = str(diff['parent_id'])
-                ws[f'B{row}'] = diff['only_in_source_count']
-                ws[f'C{row}'] = diff['only_in_target_count']
-                
-                # Status
-                if diff['only_in_source_count'] > 0 and diff['only_in_target_count'] > 0:
-                    ws[f'D{row}'] = "Different"
-                    ws[f'D{row}'].fill = self.warning_fill
-                elif diff['only_in_source_count'] > 0:
-                    ws[f'D{row}'] = "Missing in Target"
-                    ws[f'D{row}'].fill = self.info_fill
-                else:
-                    ws[f'D{row}'] = "Extra in Target"
-                    ws[f'D{row}'].fill = self.info_fill
-                
-                for col in range(1, 5):
-                    ws.cell(row=row, column=col).border = self.border
+            # Highlight based on differences
+            if has_diff:
+                ws[f'D{row}'].fill = self.info_fill
+                ws[f'E{row}'].fill = self.info_fill
+            else:
+                ws[f'D{row}'].fill = self.success_fill
+                ws[f'E{row}'].fill = self.success_fill
+        
+        # Add summary at bottom
+        row += 2
+        total_name_matched = len(name_matched)
+        with_diff = len([m for m in name_matched if m.get('has_differences')])
+        without_diff = total_name_matched - with_diff
+        
+        ws[f'A{row}'] = "Summary:"
+        ws[f'A{row}'].font = Font(bold=True)
+        row += 1
+        ws[f'A{row}'] = f"Total Name Matched: {total_name_matched}"
+        row += 1
+        ws[f'A{row}'] = f"Identical (no differences): {without_diff}"
+        row += 1
+        ws[f'A{row}'] = f"With attribute differences: {with_diff}"
         
         self._auto_adjust_columns(ws)
+    
+    # NOTE: Related entity (child) comparisons have been removed in simplified mode
     
     def generate_flow_comparison_report(self, comparison_result: Dict[str, Any], output_file: str, source_env_name: str = None, target_env_name: str = None):
         """

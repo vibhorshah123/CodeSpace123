@@ -207,17 +207,8 @@ def run_data_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
         print("Error: Table name cannot be empty!")
         return
     
-    # Ask about relationship comparison
-    print("\nComparison Options:")
-    print("  1. Compare main records only")
-    print("  2. Compare main records + related records (One-To-Many relationships/subgrids)")
-    
-    choice = input("\nSelect option [1-2]: ").strip()
-    include_relationships = choice == "2"
-    
     print(f"\nFetching data for table '{table_name}' from both environments...")
-    if include_relationships:
-        print("  (Including related records via One-To-Many relationships)")
+    print(f"Match Mode: PRIMARY NAME")
     
     try:
         # Initialize data comparison
@@ -228,8 +219,7 @@ def run_data_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
             envs["source_url"],
             envs["target_url"],
             table_name,
-            fields=None,  # Compare all fields
-            include_relationships=include_relationships
+            fields=None  # Compare all fields
         )
         
         # Display summary
@@ -239,6 +229,7 @@ def run_data_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
         print(f"Table: {table_name}")
         print(f"Source Environment: {envs['source_url']}")
         print(f"Target Environment: {envs['target_url']}")
+        print(f"Match Mode: PRIMARY NAME")
         print()
         print(f"Source records: {result['source_record_count']}")
         print(f"Target records: {result['target_record_count']}")
@@ -247,19 +238,13 @@ def run_data_comparison(auth_manager: AuthManager, envs: Dict[str, str]):
         print(f"Records only in Target: {len(result['only_in_target'])}")
         print(f"Field mismatches: {len(result['mismatches'])}")
         
-        if result.get('guid_mismatches'):
-            print(f"\n   ⚠ GUID/Lookup Mismatches: {len(result['guid_mismatches'])}")
-        
-        if result.get('name_matches_with_different_ids'):
-            print(f"   ⚠ Records with same name but different IDs: {len(result['name_matches_with_different_ids'])}")
-            print(f"      (Possible duplicates or migration issues)")
-        
-        if include_relationships and result['child_comparisons']:
-            print(f"\nRelated Entities Compared: {len(result['child_comparisons'])}")
-            for child_entity, child_data in result['child_comparisons'].items():
-                print(f"  - {child_entity}: {child_data['source_total']} source, {child_data['target_total']} target")
-                if child_data['differences']:
-                    print(f"      Differences found in {len(child_data['differences'])} parent records")
+        # Name-based info
+        if result.get('name_matched_records'):
+            print(f"\n   ℹ Records matched by name (different GUIDs observed): {len(result['name_matched_records'])}")
+        if result.get('duplicate_names_source'):
+            print(f"   ⚠ Duplicate names in source: {len(result['duplicate_names_source'])}")
+        if result.get('duplicate_names_target'):
+            print(f"   ⚠ Duplicate names in target: {len(result['duplicate_names_target'])}")
         
         print("-" * 70)
         
