@@ -16,6 +16,7 @@ using ClosedXML.Excel;
 using Azure.Storage.Blobs;
 using Azure.Core;
 using Azure.Identity;
+using Microsoft.Azure.Functions.Worker.Extensions.Timer;
 
 namespace D365ComparissionTool;
 
@@ -75,6 +76,164 @@ public class FlowComparisonFunction
     };
 
     public FlowComparisonFunction(ILogger<FlowComparisonFunction> logger) => _logger = logger;
+
+    // Weekly timer trigger to compare flows between source and multiple target environments
+    // Schedule: Friday 09:00 UTC (same as configuration comparison)
+    [Function("CompareFlowsWeekly")]
+    public async Task RunFlowsWeekly([TimerTrigger("0 0 9 * * Fri")] TimerInfo timerInfo, FunctionContext context)
+    {
+        var correlationId = Guid.NewGuid();
+        _logger.LogInformation("[CompareFlowsWeekly] Timer fired (Fri 09:00 UTC) CorrelationId={CorrelationId} LastRun={LastRun} NextRun={NextRun}", correlationId, timerInfo?.ScheduleStatus?.Last, timerInfo?.ScheduleStatus?.Next);
+        try
+        {
+            // Source environment URL (full) and host
+            var srcEnvUrl = Environment.GetEnvironmentVariable("FLOW_SOURCE_ENV_URL")
+                            ?? Environment.GetEnvironmentVariable("SOURCE_ENV_URL")
+                            ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(srcEnvUrl))
+            {
+                _logger.LogWarning("[{CorrelationId}] FLOW_SOURCE_ENV_URL/SOURCE_ENV_URL missing; aborting flow weekly run", correlationId);
+                return;
+            }
+            var srcHost = NormalizeEnvHost(srcEnvUrl);
+
+            // Determine target environment list from env var FLOW_TARGET_ENV_LIST (JSON array or comma-separated)
+            var targetsRaw = Environment.GetEnvironmentVariable("FLOW_TARGET_ENV_LIST");
+            var targetHosts = new List<string>();
+            if (!string.IsNullOrWhiteSpace(targetsRaw))
+            {
+                bool parsed = false;
+                try
+                {
+                    var arr = JsonSerializer.Deserialize<List<string>>(targetsRaw);
+                    if (arr != null && arr.Count > 0)
+                    {
+                        targetHosts.AddRange(arr.Where(a => !string.IsNullOrWhiteSpace(a)));
+                        parsed = true;
+                    }
+                }
+                catch { }
+                if (!parsed)
+                {
+                    targetHosts.AddRange(targetsRaw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                }
+            }
+            if (targetHosts.Count == 0)
+            {
+                // Fallback predefined targets (as requested)
+                var predefined = new[]
+                {
+                    "https://mashppe.crm.dynamics.com/",
+                    "https://mashtest.crm.dynamics.com/",
+                    "https://mashrb.crm.dynamics.com/",
+                    "https://mashdemo.crm.dynamics.com/"
+                };
+                foreach (var p in predefined) targetHosts.Add(p);
+            }
+            targetHosts = targetHosts.Select(h => NormalizeEnvHost(h)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            _logger.LogInformation("[{CorrelationId}] Flow weekly comparison SourceHost={SourceHost} TargetCount={Count} Targets={Targets}", correlationId, srcHost, targetHosts.Count, string.Join(',', targetHosts));
+
+            // Token acquisition via DefaultAzureCredential per environment host
+            var credential = new DefaultAzureCredential();
+            string sourceToken = await AcquireTokenForEnvAsync(srcHost, credential);
+            _logger.LogInformation("[{CorrelationId}] Acquired source token length={Len}", correlationId, sourceToken.Length);
+
+            // Shared ignore keys (same logic as HTTP function)
+            var ignoreKeysConfig = Environment.GetEnvironmentVariable("NORMALIZE_IGNORE_KEYS") ?? string.Empty;
+            var ignoreKeys = ignoreKeysConfig.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(k => k.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (ignoreKeys.Count == 0)
+            {
+                ignoreKeys.AddRange(new[] { "connectionReferences", "runtimeConfiguration", "lastModified", "createdTime", "modifiedTime", "etag", "trackedProperties" });
+            }
+
+            foreach (var tgtHost in targetHosts)
+            {
+                try
+                {
+                    string targetToken = await AcquireTokenForEnvAsync(tgtHost, credential);
+                    _logger.LogInformation("[{CorrelationId}] Processing target host={TargetHost} tokenLength={Len}", correlationId, tgtHost, targetToken.Length);
+
+                    // Fetch flows for source and target
+                    var env1Flows = await FetchAndPrepareAllFlows(srcHost, sourceToken, ignoreKeys, correlationId);
+                    var env2Flows = await FetchAndPrepareAllFlows(tgtHost, targetToken, ignoreKeys, correlationId);
+                    var comparisons = new List<FlowComparisonResult>();
+
+                    // Build lookup maps for target by name
+                    var env2LookupByName = env2Flows.GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
+                        .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var f1 in env1Flows)
+                    {
+                        env2LookupByName.TryGetValue(f1.Name, out var f2);
+                        if (f2 == null)
+                        {
+                            comparisons.Add(new FlowComparisonResult(f1.Name, f1, null, false, null, null, "missing_in_env2"));
+                            continue;
+                        }
+                        if (!string.IsNullOrEmpty(f1.Error) || !string.IsNullOrEmpty(f2.Error))
+                        {
+                            comparisons.Add(new FlowComparisonResult(f1.Name, f1, f2, false, null, null, "error"));
+                            continue;
+                        }
+                        bool identical = string.Equals(f1.Hash, f2.Hash, StringComparison.OrdinalIgnoreCase);
+                        FlowComparisonDiff? diff = null;
+                        List<FlowActionDifference>? actionDiffs = null;
+                        if (!identical)
+                        {
+                            diff = ComputeDiff(f1.CanonicalJson, f2.CanonicalJson);
+                            actionDiffs = ComputeActionDifferences(f1.CanonicalJson, f2.CanonicalJson);
+                        }
+                        comparisons.Add(new FlowComparisonResult(f1.Name, f1, f2, identical, diff, actionDiffs, identical ? "identical" : "different"));
+                    }
+
+                    // Build Excel and upload
+                    string? excelBlobUrl = null;
+                    try
+                    {
+                        var wbBytes = BuildFlowComparisonExcel(env1Flows, env2Flows, comparisons, srcHost, tgtHost, DateTime.UtcNow);
+                        string storageUrl = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL") ?? string.Empty;
+                        string containerName = Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER") ?? "comparissiontooloutput";
+                        string blobName = GenerateFlowBlobName(srcHost, tgtHost, null);
+                        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONTAINER_SAS_URL")))
+                        {
+                            var sas = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONTAINER_SAS_URL");
+                            excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, containerSasUrl: sas);
+                        }
+                        else if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONNECTION_STRING")))
+                        {
+                            var cs = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONNECTION_STRING");
+                            excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, connectionString: cs, containerName: containerName);
+                        }
+                        else if (!string.IsNullOrWhiteSpace(storageUrl))
+                        {
+                            excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, accountUrl: storageUrl, containerName: containerName, credential: credential);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("[{CorrelationId}] No storage configuration provided; Excel not uploaded for target={TargetHost}", correlationId, tgtHost);
+                        }
+                        if (!string.IsNullOrWhiteSpace(excelBlobUrl))
+                        {
+                            _logger.LogInformation("[{CorrelationId}] Flow weekly Excel uploaded Target={TargetHost} BlobUrl={BlobUrl}", correlationId, tgtHost, excelBlobUrl);
+                        }
+                    }
+                    catch (Exception exUp)
+                    {
+                        _logger.LogError(exUp, "[{CorrelationId}] Excel generation/upload failed for target={TargetHost}", correlationId, tgtHost);
+                    }
+                }
+                catch (Exception exTarget)
+                {
+                    _logger.LogError(exTarget, "[{CorrelationId}] Flow weekly comparison failed for target host={TargetHost}", correlationId, tgtHost);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[CompareFlowsWeekly] Unhandled error CorrelationId={CorrelationId}", correlationId);
+        }
+    }
 
     [Function("CompareFlows")] // HTTP trigger for flow comparison
     public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Function, "post", Route = "CompareFlows")] HttpRequestData req, FunctionContext ctx)
@@ -366,6 +525,14 @@ public class FlowComparisonFunction
         int slash = e.IndexOf('/')
 ;        if (slash >= 0) e = e[..slash];
         return e.Trim();
+    }
+
+    private static async Task<string> AcquireTokenForEnvAsync(string envHost, DefaultAzureCredential credential)
+    {
+        // Scope uses full https://host/.default
+        var scope = $"https://{envHost.TrimEnd('/')}/.default";
+        var token = await credential.GetTokenAsync(new TokenRequestContext(new[] { scope }));
+        return token.Token;
     }
 
     private async Task<List<FlowSnapshot>> FetchAndPrepareAllFlows(string env, string token, List<string> ignoreKeys, Guid correlationId)
@@ -748,8 +915,29 @@ public class FlowComparisonFunction
             if (!safe.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase)) safe += ".xlsx";
             return safe;
         }
+        // New naming convention requested:
+        // D365Flow_Comparision_<SourceShort>_Vs_<TargetShort>_<Timestamp>.xlsx
+        // If single env (no env2) -> D365Flow_Comparision_<SourceShort>_<Timestamp>.xlsx
         var ts = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-        return !string.IsNullOrWhiteSpace(env2Host) ? $"flowcomparison-{env1Host}-vs-{env2Host}-{ts}.xlsx" : $"flowcomparison-{env1Host}-{ts}.xlsx";
+        string srcShort = ExtractShortHost(env1Host);
+        if (string.IsNullOrWhiteSpace(env2Host))
+        {
+            return $"D365Flow_Comparision_{srcShort}_{ts}.xlsx";
+        }
+        string tgtShort = ExtractShortHost(env2Host);
+        return $"D365Flow_Comparision_{srcShort}_Vs_{tgtShort}_{ts}.xlsx";
+    }
+
+    private static string ExtractShortHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host)) return "env";
+        var h = host.Trim();
+        // remove protocol if accidentally included
+        if (h.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) h = h[8..];
+        else if (h.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) h = h[7..];
+        int dot = h.IndexOf('.');
+        if (dot > 0) return h.Substring(0, dot);
+        return h;
     }
 
     private static async Task<string> UploadExcelWithFlexibleAuthAsync(byte[] bytes, string blobName, string? accountUrl = null, string? containerName = null, TokenCredential? credential = null, string? connectionString = null, string? containerSasUrl = null)

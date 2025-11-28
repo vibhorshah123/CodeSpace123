@@ -14,6 +14,7 @@ using Azure.Storage.Blobs;
 using ClosedXML.Excel;
 using System.Xml.Linq;
 using System.Text.RegularExpressions;
+using Microsoft.Azure.Functions.Worker.Extensions.Timer;
 
 namespace D365ComparissionTool;
 
@@ -53,7 +54,6 @@ public class ComparisonRequest
 
     public List<SubgridRelationRequest> SubgridRelationships { get; set; } = new();
 }
-
 public class SubgridRelationRequest
 {
     public string ChildEntityLogicalName { get; set; } = string.Empty; // e.g. mash_childentity
@@ -130,6 +130,188 @@ public class ConfigurationComparisionFunction
         PropertyNameCaseInsensitive = true,
         WriteIndented = true
     };
+
+    // Weekly timer trigger (every Friday at 00:00 UTC)
+    [Function("CompareDataverseWeekly")]
+    public async Task RunWeekly([TimerTrigger("0 0 9 * * Fri")] TimerInfo timerInfo, FunctionContext context)
+    {
+        var correlationId = Guid.NewGuid();
+        _logger.LogInformation("[CompareDataverseWeekly] Timer fired (Fri 09:00 UTC) CorrelationId={CorrelationId} LastRun={LastRun} NextRun={NextRun}", correlationId, timerInfo?.ScheduleStatus?.Last, timerInfo?.ScheduleStatus?.Next);
+        try
+        {
+            var srcEnv = Environment.GetEnvironmentVariable("SOURCE_ENV_URL") ?? string.Empty;
+            var tgtEnv = Environment.GetEnvironmentVariable("TARGET_ENV_URL") ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(srcEnv) || string.IsNullOrWhiteSpace(tgtEnv))
+            {
+                _logger.LogWarning("[{CorrelationId}] SOURCE_ENV_URL or TARGET_ENV_URL missing; skipping weekly comparison", correlationId);
+                return;
+            }
+            // Determine mode (single | list) from env, default list
+            var modeEnv = (Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_MODE") ?? "list").Trim().ToLowerInvariant();
+
+            // Parse entities from JSON array env or fallback comma-separated list
+            List<string> entities = new();
+            var entitiesJson = Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_ENTITIES_JSON");
+            if (!string.IsNullOrWhiteSpace(entitiesJson))
+            {
+                try
+                {
+                    var parsed = JsonSerializer.Deserialize<List<string>>(entitiesJson);
+                    if (parsed != null) entities.AddRange(parsed);
+                }
+                catch (Exception jex)
+                {
+                    _logger.LogWarning(jex, "[{CorrelationId}] Failed to parse COMPARISON_WEEKLY_ENTITIES_JSON; falling back to COMPARISON_WEEKLY_ENTITIES", correlationId);
+                }
+            }
+            if (entities.Count == 0)
+            {
+                var entitiesRaw = Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_ENTITIES") ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(entitiesRaw))
+                {
+                    entities.AddRange(entitiesRaw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                }
+            }
+            entities = entities.Select(e => e.Trim()).Where(e => !string.IsNullOrWhiteSpace(e)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+            var singleEntityEnv = Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_ENTITY")?.Trim();
+            bool singleMode = modeEnv == "single" || (!string.IsNullOrWhiteSpace(singleEntityEnv)) || (entities.Count == 1);
+
+            var request = new ComparisonRequest
+            {
+                Mode = singleMode ? "single" : "list",
+                SourceEnvUrl = srcEnv,
+                TargetEnvUrl = tgtEnv,
+                AutoDiscoverSubgrids = false
+            };
+
+            if (singleMode)
+            {
+                // Determine entity logical name priority: explicit single env variable > first of list
+                string? entityLogical = singleEntityEnv;
+                if (string.IsNullOrWhiteSpace(entityLogical)) entityLogical = entities.FirstOrDefault();
+                if (string.IsNullOrWhiteSpace(entityLogical))
+                {
+                    _logger.LogWarning("[{CorrelationId}] No entity provided for single weekly comparison; aborting", correlationId);
+                    return;
+                }
+                request.EntityLogicalName = entityLogical;
+                _logger.LogInformation("[{CorrelationId}] Weekly single entity comparison Entity={Entity}", correlationId, entityLogical);
+            }
+            else
+            {
+                if (entities.Count == 0)
+                {
+                    _logger.LogWarning("[{CorrelationId}] No entities specified for weekly list comparison; skipping", correlationId);
+                    return;
+                }
+                request.Entities = entities;
+                _logger.LogInformation("[{CorrelationId}] Weekly list entity comparison Count={Count} Entities={Entities}", correlationId, entities.Count, string.Join(',', entities));
+            }
+
+            if (bool.TryParse(Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_AUTODISCOVER_SUBGRIDS"), out var ad)) request.AutoDiscoverSubgrids = ad;
+            request.SourceBearerToken = Environment.GetEnvironmentVariable("SOURCE_BEARER_TOKEN");
+            request.TargetBearerToken = Environment.GetEnvironmentVariable("TARGET_BEARER_TOKEN");
+            request.StorageAccountUrl = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL");
+            request.OutputContainerName = Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER");
+            request.StorageConnectionString = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONNECTION_STRING");
+            request.StorageContainerSasUrl = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONTAINER_SAS_URL");
+
+            var credential = new DefaultAzureCredential();
+            string sourceToken = !string.IsNullOrWhiteSpace(request.SourceBearerToken) ? request.SourceBearerToken.Trim() : await AcquireSourceTokenAsync(request, credential);
+
+            // Determine multi-target set (always compare source against each target environment)
+            var targetEnvList = new List<string>();
+            // Parse COMPARISON_WEEKLY_TARGETS (JSON array or comma-separated) if present
+            var multiTargetsRaw = Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_TARGETS");
+            if (!string.IsNullOrWhiteSpace(multiTargetsRaw))
+            {
+                bool parsed = false;
+                try
+                {
+                    var arr = JsonSerializer.Deserialize<List<string>>(multiTargetsRaw);
+                    if (arr != null && arr.Count > 0)
+                    {
+                        targetEnvList.AddRange(arr.Where(a => !string.IsNullOrWhiteSpace(a))); parsed = true;
+                    }
+                }
+                catch { }
+                if (!parsed)
+                {
+                    targetEnvList.AddRange(multiTargetsRaw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                }
+            }
+            if (targetEnvList.Count == 0)
+            {
+                // Fallback: use TARGET_ENV_URL env plus predefined list if source is mash and not already provided
+                targetEnvList.Add(tgtEnv.Trim());
+                if (srcEnv.Trim().StartsWith("https://mash.crm.dynamics.com", StringComparison.OrdinalIgnoreCase))
+                {
+                    var predefined = new[]
+                    {
+                        "https://mashppe.crm.dynamics.com/",
+                        "https://mashtest.crm.dynamics.com/",
+                        "https://mashrb.crm.dynamics.com/",
+                        "https://mashdemo.crm.dynamics.com/"
+                    };
+                    foreach (var p in predefined)
+                        if (!targetEnvList.Contains(p, StringComparer.OrdinalIgnoreCase)) targetEnvList.Add(p);
+                }
+            }
+            targetEnvList = targetEnvList.Select(e => e.Trim()).Where(e => !string.IsNullOrWhiteSpace(e)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            _logger.LogInformation("[{CorrelationId}] Weekly comparison target environments Count={Count} Targets={Targets}", correlationId, targetEnvList.Count, string.Join(',', targetEnvList));
+
+            foreach (var targetEnv in targetEnvList)
+            {
+                request.TargetEnvUrl = targetEnv; // set target for this iteration
+                string targetToken = !string.IsNullOrWhiteSpace(request.TargetBearerToken) ? request.TargetBearerToken.Trim() : await AcquireTargetTokenAsync(request, credential);
+                _logger.LogInformation("[{CorrelationId}] Processing target {TargetEnv} Mode={Mode}", correlationId, targetEnv, request.Mode);
+                if (singleMode)
+                {
+                    try
+                    {
+                        var singleReport = await CompareSingleEntityAsync(request, sourceToken, targetToken, credential, correlationId, skipExcelUpload: false);
+                        _logger.LogInformation("[{CorrelationId}] Weekly single entity comparison finished Target={TargetEnv} Entity={Entity} Excel={Excel}", correlationId, targetEnv, request.EntityLogicalName, singleReport.ExcelBlobUrl);
+                    }
+                    catch (Exception exSingle)
+                    {
+                        _logger.LogError(exSingle, "[{CorrelationId}] Weekly single entity comparison failed Target={TargetEnv} Entity={Entity}", correlationId, targetEnv, request.EntityLogicalName);
+                    }
+                }
+                else
+                {
+                    var results = new List<(string Entity, DiffReport Report)>();
+                    foreach (var entity in request.Entities)
+                    {
+                        request.EntityLogicalName = entity;
+                        var report = await CompareSingleEntityAsync(request, sourceToken, targetToken, credential, correlationId, skipExcelUpload: true);
+                        results.Add((entity, report));
+                    }
+                    try
+                    {
+                        byte[] excelBytes = BuildMultiEntityExcel(results, request.SourceEnvUrl, targetEnv, DateTime.UtcNow);
+                        string blobName = GenerateBlobName(request.SourceEnvUrl, targetEnv, "multi", isCombined: true);
+                        string containerName = request.OutputContainerName ?? "comparissiontooloutput";
+                        string storageUrl = request.StorageAccountUrl ?? string.Empty;
+                        string? uploadedUrl = null;
+                        if (!string.IsNullOrWhiteSpace(request.StorageContainerSasUrl)) uploadedUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, containerSasUrl: request.StorageContainerSasUrl);
+                        else if (!string.IsNullOrWhiteSpace(request.StorageConnectionString)) uploadedUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, connectionString: request.StorageConnectionString, containerName: containerName);
+                        else if (!string.IsNullOrWhiteSpace(storageUrl)) uploadedUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, accountUrl: storageUrl, containerName: containerName, credential: credential);
+                        if (!string.IsNullOrWhiteSpace(uploadedUrl)) _logger.LogInformation("[{CorrelationId}] Weekly list comparison uploaded Excel={BlobUrl} Target={TargetEnv} Entities={EntityCount}", correlationId, uploadedUrl, targetEnv, results.Count);
+                        else _logger.LogWarning("[{CorrelationId}] Weekly list comparison Excel not uploaded (no storage config) Target={TargetEnv}", correlationId, targetEnv);
+                    }
+                    catch (Exception upEx)
+                    {
+                        _logger.LogError(upEx, "[{CorrelationId}] Weekly list Excel generation/upload failed Target={TargetEnv}", correlationId, targetEnv);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[CompareDataverseWeekly] Unhandled error CorrelationId={CorrelationId}", correlationId);
+        }
+    }
 
     // Added helper methods for field validation
     private static async Task<bool> IsFieldSelectableAsync(string envUrl, string entityLogicalName, string field, string accessToken)
@@ -1642,15 +1824,13 @@ public class ConfigurationComparisionFunction
 
     private static string GenerateBlobName(string sourceEnvUrl, string targetEnvUrl, string entityLogicalName, bool isCombined = false)
     {
-        var src = ExtractEnvShortName(sourceEnvUrl);
-        var tgt = ExtractEnvShortName(targetEnvUrl);
+        // New naming convention requested:
+        // D365Config_Comparision_<SourceShort>_Vs_<TargetShort>_<Timestamp>.xlsx
+        // Applies to both single-entity and multi-entity outputs. Entity name no longer embedded.
+        var srcShort = ExtractEnvShortName(sourceEnvUrl);
+        var tgtShort = ExtractEnvShortName(targetEnvUrl);
         var ts = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-        if (isCombined)
-        {
-            return $"comparison-{src}-vs-{tgt}-multi-{ts}.xlsx";
-        }
-        var safeEntity = new string(entityLogicalName.Select(ch => char.IsLetterOrDigit(ch) ? ch : '_').ToArray());
-        return $"comparison-{src}-vs-{tgt}-{safeEntity}-{ts}.xlsx";
+        return $"D365Config_Comparision_{srcShort}_Vs_{tgtShort}_{ts}.xlsx";
     }
 
     private static async Task<string> UploadExcelWithFlexibleAuthAsync(byte[] bytes, string blobName, string? accountUrl = null, string? containerName = null, TokenCredential? credential = null, string? connectionString = null, string? containerSasUrl = null)
