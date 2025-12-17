@@ -26,16 +26,11 @@ public class ComparisonRequest
     public string EntityLogicalName { get; set; } = string.Empty;
     public List<string> Entities { get; set; } = new(); // for list mode
     public List<string> FieldsToCompare { get; set; } = new();
-    public bool AutoDiscoverSubgrids { get; set; } // if true and SubgridRelationships empty, discover all one-to-many relationships
+    public bool AutoDiscoverSubgrids { get; set; } // if true and SubgridRelationships empty, discover all one-to-many relationships 
     // Direct bearer tokens (preferred when provided)
     public string? SourceBearerToken { get; set; }
     public string? TargetBearerToken { get; set; }
-    // Output storage settings
-    public string? StorageAccountUrl { get; set; }
-    public string? OutputContainerName { get; set; }
-    public string? OutputFileName { get; set; }
-    // New flexible auth options for storage
-    public string? StorageConnectionString { get; set; } // full connection string
+    // Storage (SAS only now)
     public string? StorageContainerSasUrl { get; set; } // SAS URL directly to container (https://acct.blob.core.windows.net/container?sv=...)
 
     // Legacy token generation
@@ -56,7 +51,7 @@ public class ComparisonRequest
 }
 public class SubgridRelationRequest
 {
-    public string ChildEntityLogicalName { get; set; } = string.Empty; // e.g. mash_childentity
+    public string ChildEntityLogicalName { get; set; } = string.Empty; // e.g. childentity
     public string ChildParentFieldLogicalName { get; set; } = string.Empty; // lookup field on child pointing to parent (guid)
     public List<string> ChildFields { get; set; } = new(); // fields to compare on child
     public bool OnlyActiveChildren { get; set; } = true; // apply statecode eq 0 filter
@@ -72,19 +67,51 @@ public class MismatchDetail
     public object? TargetValue { get; set; }
 }
 
+// Key-based (Primary Name Attribute) mismatch detail
+public class MismatchDetail_K
+{
+    public string RecordKey { get; set; } = string.Empty; // Primary name attribute value used as key
+    public Guid? SourceRecordId { get; set; } // GUID in source (may differ from target)
+    public Guid? TargetRecordId { get; set; } // GUID in target (may differ from source)
+    public string FieldName { get; set; } = string.Empty;
+    public object? SourceValue { get; set; }
+    public object? TargetValue { get; set; }
+}
+
 public class MultiFieldMismatch
 {
     public Guid RecordId { get; set; }
     public List<MismatchDetail> FieldMismatches { get; set; } = new();
 }
 
+// Key-based multi-field mismatch
+public class MultiFieldMismatch_K
+{
+    public string RecordKey { get; set; } = string.Empty;
+    public Guid? SourceRecordId { get; set; }
+    public Guid? TargetRecordId { get; set; }
+    public List<MismatchDetail_K> FieldMismatches { get; set; } = new();
+}
+
 public class DiffReport
 {
+    // GUID-based comparison results
     public List<Dictionary<string, object?>> OnlyInSource { get; set; } = new();
     public List<Dictionary<string, object?>> OnlyInTarget { get; set; } = new();
     public List<MismatchDetail> Mismatches { get; set; } = new();
     public List<MultiFieldMismatch> MultiFieldMismatches { get; set; } = new();
     public List<Guid> MatchingRecordIds { get; set; } = new();
+    
+    // Key-based (Primary Name Attribute) comparison results - suffix _K
+    public List<Dictionary<string, object?>> OnlyInSource_K { get; set; } = new();
+    public List<Dictionary<string, object?>> OnlyInTarget_K { get; set; } = new();
+    public List<MismatchDetail_K> Mismatches_K { get; set; } = new();
+    public List<MultiFieldMismatch_K> MultiFieldMismatches_K { get; set; } = new();
+    public List<string> MatchingRecordKeys_K { get; set; } = new(); // Keys that match
+    public Dictionary<string, (Guid SourceId, Guid TargetId)> MatchingRecordIdsByKey_K { get; set; } = new(); // Key -> (SourceGuid, TargetGuid)
+    public bool AllRecordsHaveEmptyPrimaryKey_K { get; set; } // True if all records in both source and target have empty/null primary name attribute value
+    public int SkippedRecordsWithEmptyKey_K { get; set; } // Count of records skipped due to empty primary key value
+    
     public List<string> ComparedFields { get; set; } = new();
     public string Notes { get; set; } = string.Empty;
     public string? ExcelBlobUrl { get; set; }
@@ -131,7 +158,7 @@ public class ConfigurationComparisionFunction
         WriteIndented = true
     };
 
-    // Weekly timer trigger (every Friday at 00:00 UTC)
+    // Weekly timer trigger (every Friday at 00:00 UTC) - list mode only
     [Function("CompareDataverseWeekly")]
     public async Task RunWeekly([TimerTrigger("0 0 9 * * Fri")] TimerInfo timerInfo, FunctionContext context)
     {
@@ -139,171 +166,116 @@ public class ConfigurationComparisionFunction
         _logger.LogInformation("[CompareDataverseWeekly] Timer fired (Fri 09:00 UTC) CorrelationId={CorrelationId} LastRun={LastRun} NextRun={NextRun}", correlationId, timerInfo?.ScheduleStatus?.Last, timerInfo?.ScheduleStatus?.Next);
         try
         {
-            var srcEnv = Environment.GetEnvironmentVariable("SOURCE_ENV_URL") ?? string.Empty;
-            var tgtEnv = Environment.GetEnvironmentVariable("TARGET_ENV_URL") ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(srcEnv) || string.IsNullOrWhiteSpace(tgtEnv))
+            // Source (single URL) and targets (one or more) are read strictly from environment variables.
+            // No hardcoded URLs or implicit additions. Legacy env vars removed: COMPARISON_WEEKLY_ENTITIES, COMPARISON_WEEKLY_TARGETS.
+            var sourceEnv = Environment.GetEnvironmentVariable("SOURCE_ENV_URL") ?? string.Empty;
+            var defaultTargetEnv = Environment.GetEnvironmentVariable("TARGET_ENV_URL") ?? string.Empty; // optional if list provided
+            if (string.IsNullOrWhiteSpace(sourceEnv))
             {
-                _logger.LogWarning("[{CorrelationId}] SOURCE_ENV_URL or TARGET_ENV_URL missing; skipping weekly comparison", correlationId);
+                _logger.LogWarning("[{CorrelationId}] SOURCE_ENV_URL missing; skipping weekly comparison", correlationId);
                 return;
             }
-            // Determine mode (single | list) from env, default list
-            var modeEnv = (Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_MODE") ?? "list").Trim().ToLowerInvariant();
-
-            // Parse entities from JSON array env or fallback comma-separated list
-            List<string> entities = new();
+            // Parse entity list (list mode only) - REQUIRED: COMPARISON_WEEKLY_ENTITIES_JSON (JSON array)
             var entitiesJson = Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_ENTITIES_JSON");
-            if (!string.IsNullOrWhiteSpace(entitiesJson))
+            List<string> entities;
+            if (string.IsNullOrWhiteSpace(entitiesJson))
             {
-                try
-                {
-                    var parsed = JsonSerializer.Deserialize<List<string>>(entitiesJson);
-                    if (parsed != null) entities.AddRange(parsed);
-                }
-                catch (Exception jex)
-                {
-                    _logger.LogWarning(jex, "[{CorrelationId}] Failed to parse COMPARISON_WEEKLY_ENTITIES_JSON; falling back to COMPARISON_WEEKLY_ENTITIES", correlationId);
-                }
+                _logger.LogWarning("[{CorrelationId}] COMPARISON_WEEKLY_ENTITIES_JSON missing or empty; skipping weekly comparison", correlationId);
+                return;
+            }
+            try
+            {
+                entities = (JsonSerializer.Deserialize<List<string>>(entitiesJson) ?? new List<string>())
+                    .Select(e => e?.Trim())
+                    .Where(e => !string.IsNullOrWhiteSpace(e))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+            }
+            catch (Exception exEntities)
+            {
+                _logger.LogWarning(exEntities, "[{CorrelationId}] Failed to parse COMPARISON_WEEKLY_ENTITIES_JSON; skipping weekly comparison", correlationId);
+                return;
             }
             if (entities.Count == 0)
             {
-                var entitiesRaw = Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_ENTITIES") ?? string.Empty;
-                if (!string.IsNullOrWhiteSpace(entitiesRaw))
-                {
-                    entities.AddRange(entitiesRaw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-                }
+                _logger.LogWarning("[{CorrelationId}] COMPARISON_WEEKLY_ENTITIES_JSON parsed but produced zero entities; skipping weekly comparison", correlationId);
+                return;
             }
-            entities = entities.Select(e => e.Trim()).Where(e => !string.IsNullOrWhiteSpace(e)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-
-            var singleEntityEnv = Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_ENTITY")?.Trim();
-            bool singleMode = modeEnv == "single" || (!string.IsNullOrWhiteSpace(singleEntityEnv)) || (entities.Count == 1);
-
             var request = new ComparisonRequest
             {
-                Mode = singleMode ? "single" : "list",
-                SourceEnvUrl = srcEnv,
-                TargetEnvUrl = tgtEnv,
-                AutoDiscoverSubgrids = false
+                Mode = "list",
+                SourceEnvUrl = sourceEnv,
+                TargetEnvUrl = defaultTargetEnv,
+                Entities = entities
             };
+            if (bool.TryParse(Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_AUTODISCOVER_SUBGRIDS"), out var autoSubgrids)) request.AutoDiscoverSubgrids = autoSubgrids;
+            // Bearer tokens and SAS uploads are no longer supported; using Managed Identity exclusively.
+            _logger.LogInformation("[{CorrelationId}] Weekly list comparison EntityCount={Count} Entities={Entities}", correlationId, entities.Count, string.Join(',', entities));
 
-            if (singleMode)
-            {
-                // Determine entity logical name priority: explicit single env variable > first of list
-                string? entityLogical = singleEntityEnv;
-                if (string.IsNullOrWhiteSpace(entityLogical)) entityLogical = entities.FirstOrDefault();
-                if (string.IsNullOrWhiteSpace(entityLogical))
-                {
-                    _logger.LogWarning("[{CorrelationId}] No entity provided for single weekly comparison; aborting", correlationId);
-                    return;
-                }
-                request.EntityLogicalName = entityLogical;
-                _logger.LogInformation("[{CorrelationId}] Weekly single entity comparison Entity={Entity}", correlationId, entityLogical);
-            }
-            else
-            {
-                if (entities.Count == 0)
-                {
-                    _logger.LogWarning("[{CorrelationId}] No entities specified for weekly list comparison; skipping", correlationId);
-                    return;
-                }
-                request.Entities = entities;
-                _logger.LogInformation("[{CorrelationId}] Weekly list entity comparison Count={Count} Entities={Entities}", correlationId, entities.Count, string.Join(',', entities));
-            }
+            TokenCredential credential = GetManagedIdentityCredential() is ManagedIdentityCredential miCredWeekly ? miCredWeekly : new DefaultAzureCredential();
+            string sourceToken = await AcquireSourceTokenAsync(request, credential);
 
-            if (bool.TryParse(Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_AUTODISCOVER_SUBGRIDS"), out var ad)) request.AutoDiscoverSubgrids = ad;
-            request.SourceBearerToken = Environment.GetEnvironmentVariable("SOURCE_BEARER_TOKEN");
-            request.TargetBearerToken = Environment.GetEnvironmentVariable("TARGET_BEARER_TOKEN");
-            request.StorageAccountUrl = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL");
-            request.OutputContainerName = Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER");
-            request.StorageConnectionString = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONNECTION_STRING");
-            request.StorageContainerSasUrl = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONTAINER_SAS_URL");
-
-            var credential = new DefaultAzureCredential();
-            string sourceToken = !string.IsNullOrWhiteSpace(request.SourceBearerToken) ? request.SourceBearerToken.Trim() : await AcquireSourceTokenAsync(request, credential);
-
-            // Determine multi-target set (always compare source against each target environment)
+            // Build target environments list strictly from env vars (no hardcoded additions)
             var targetEnvList = new List<string>();
-            // Parse COMPARISON_WEEKLY_TARGETS (JSON array or comma-separated) if present
-            var multiTargetsRaw = Environment.GetEnvironmentVariable("COMPARISON_WEEKLY_TARGETS");
-            if (!string.IsNullOrWhiteSpace(multiTargetsRaw))
+            var targetsUrlsEnv = Environment.GetEnvironmentVariable("TARGET_ENV_URLS");
+            if (!string.IsNullOrWhiteSpace(targetsUrlsEnv))
             {
-                bool parsed = false;
-                try
+                bool parsedUrls = false;
+                try { var arr = JsonSerializer.Deserialize<List<string>>(targetsUrlsEnv); if (arr != null && arr.Count > 0) { targetEnvList.AddRange(arr.Where(a => !string.IsNullOrWhiteSpace(a))); parsedUrls = true; } } catch { }
+                if (!parsedUrls)
                 {
-                    var arr = JsonSerializer.Deserialize<List<string>>(multiTargetsRaw);
-                    if (arr != null && arr.Count > 0)
-                    {
-                        targetEnvList.AddRange(arr.Where(a => !string.IsNullOrWhiteSpace(a))); parsed = true;
-                    }
-                }
-                catch { }
-                if (!parsed)
-                {
-                    targetEnvList.AddRange(multiTargetsRaw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                    targetEnvList.AddRange(targetsUrlsEnv.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
                 }
             }
+            // Single TARGET_ENV_URL fallback retained for convenience when only one target is needed.
+            if (targetEnvList.Count == 0 && !string.IsNullOrWhiteSpace(defaultTargetEnv)) targetEnvList.Add(defaultTargetEnv.Trim());
+            targetEnvList = targetEnvList.Select(t => t.Trim()).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             if (targetEnvList.Count == 0)
             {
-                // Fallback: use TARGET_ENV_URL env plus predefined list if source is mash and not already provided
-                targetEnvList.Add(tgtEnv.Trim());
-                if (srcEnv.Trim().StartsWith("https://mash.crm.dynamics.com", StringComparison.OrdinalIgnoreCase))
-                {
-                    var predefined = new[]
-                    {
-                        "https://mashppe.crm.dynamics.com/",
-                        "https://mashtest.crm.dynamics.com/",
-                        "https://mashrb.crm.dynamics.com/",
-                        "https://mashdemo.crm.dynamics.com/"
-                    };
-                    foreach (var p in predefined)
-                        if (!targetEnvList.Contains(p, StringComparer.OrdinalIgnoreCase)) targetEnvList.Add(p);
-                }
+                _logger.LogWarning("[{CorrelationId}] No target environments found; set TARGET_ENV_URLS (preferred) or TARGET_ENV_URL", correlationId);
+                return;
             }
-            targetEnvList = targetEnvList.Select(e => e.Trim()).Where(e => !string.IsNullOrWhiteSpace(e)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            _logger.LogInformation("[{CorrelationId}] Weekly comparison target environments Count={Count} Targets={Targets}", correlationId, targetEnvList.Count, string.Join(',', targetEnvList));
+            _logger.LogInformation("[{CorrelationId}] Weekly target environments Count={Count} Targets={Targets}", correlationId, targetEnvList.Count, string.Join(',', targetEnvList));
 
             foreach (var targetEnv in targetEnvList)
             {
-                request.TargetEnvUrl = targetEnv; // set target for this iteration
-                string targetToken = !string.IsNullOrWhiteSpace(request.TargetBearerToken) ? request.TargetBearerToken.Trim() : await AcquireTargetTokenAsync(request, credential);
-                _logger.LogInformation("[{CorrelationId}] Processing target {TargetEnv} Mode={Mode}", correlationId, targetEnv, request.Mode);
-                if (singleMode)
+                request.TargetEnvUrl = targetEnv;
+                string targetToken = await AcquireTargetTokenAsync(request, credential);
+                _logger.LogInformation("[{CorrelationId}] Processing target {TargetEnv} list aggregation", correlationId, targetEnv);
+                var originalEntity = request.EntityLogicalName;
+                var results = new List<(string Entity, DiffReport Report)>();
+                foreach (var entity in request.Entities)
                 {
                     try
-                    {
-                        var singleReport = await CompareSingleEntityAsync(request, sourceToken, targetToken, credential, correlationId, skipExcelUpload: false);
-                        _logger.LogInformation("[{CorrelationId}] Weekly single entity comparison finished Target={TargetEnv} Entity={Entity} Excel={Excel}", correlationId, targetEnv, request.EntityLogicalName, singleReport.ExcelBlobUrl);
-                    }
-                    catch (Exception exSingle)
-                    {
-                        _logger.LogError(exSingle, "[{CorrelationId}] Weekly single entity comparison failed Target={TargetEnv} Entity={Entity}", correlationId, targetEnv, request.EntityLogicalName);
-                    }
-                }
-                else
-                {
-                    var results = new List<(string Entity, DiffReport Report)>();
-                    foreach (var entity in request.Entities)
                     {
                         request.EntityLogicalName = entity;
-                        var report = await CompareSingleEntityAsync(request, sourceToken, targetToken, credential, correlationId, skipExcelUpload: true);
-                        results.Add((entity, report));
+                        var rep = await CompareSingleEntityAsync(request, sourceToken, targetToken, credential, correlationId, skipExcelUpload: true);
+                        results.Add((entity, rep));
                     }
-                    try
+                    catch (Exception perEntityEx)
                     {
-                        byte[] excelBytes = BuildMultiEntityExcel(results, request.SourceEnvUrl, targetEnv, DateTime.UtcNow);
-                        string blobName = GenerateBlobName(request.SourceEnvUrl, targetEnv, "multi", isCombined: true);
-                        string containerName = request.OutputContainerName ?? "comparissiontooloutput";
-                        string storageUrl = request.StorageAccountUrl ?? string.Empty;
-                        string? uploadedUrl = null;
-                        if (!string.IsNullOrWhiteSpace(request.StorageContainerSasUrl)) uploadedUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, containerSasUrl: request.StorageContainerSasUrl);
-                        else if (!string.IsNullOrWhiteSpace(request.StorageConnectionString)) uploadedUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, connectionString: request.StorageConnectionString, containerName: containerName);
-                        else if (!string.IsNullOrWhiteSpace(storageUrl)) uploadedUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, accountUrl: storageUrl, containerName: containerName, credential: credential);
-                        if (!string.IsNullOrWhiteSpace(uploadedUrl)) _logger.LogInformation("[{CorrelationId}] Weekly list comparison uploaded Excel={BlobUrl} Target={TargetEnv} Entities={EntityCount}", correlationId, uploadedUrl, targetEnv, results.Count);
-                        else _logger.LogWarning("[{CorrelationId}] Weekly list comparison Excel not uploaded (no storage config) Target={TargetEnv}", correlationId, targetEnv);
+                        _logger.LogError(perEntityEx, "[{CorrelationId}] Weekly list comparison failed Target={TargetEnv} Entity={Entity}", correlationId, targetEnv, entity);
                     }
-                    catch (Exception upEx)
+                }
+                request.EntityLogicalName = originalEntity;
+                try
+                {
+                    var excelBytes = BuildMultiEntityExcel(results, request.SourceEnvUrl, targetEnv, DateTime.UtcNow);
+                    string blobName = GenerateBlobName(request.SourceEnvUrl, targetEnv, "multi", isCombined: true);
+                    // Try Managed Identity upload first
+                    var miUploaded = await TryUploadWithManagedIdentityAsync(excelBytes, blobName);
+                    if (!string.IsNullOrWhiteSpace(miUploaded))
                     {
-                        _logger.LogError(upEx, "[{CorrelationId}] Weekly list Excel generation/upload failed Target={TargetEnv}", correlationId, targetEnv);
+                        _logger.LogInformation("[{CorrelationId}] Weekly aggregated Excel uploaded via MI Target={TargetEnv} Blob={BlobUrl} EntityCount={EntityCount}", correlationId, targetEnv, miUploaded, results.Count);
                     }
+                    else
+                    {
+                        _logger.LogWarning("[{CorrelationId}] Weekly aggregated Excel not uploaded (Managed Identity storage config missing)", correlationId);
+                    }
+                }
+                catch (Exception upEx)
+                {
+                    _logger.LogError(upEx, "[{CorrelationId}] Weekly aggregated Excel generation/upload failed Target={TargetEnv}", correlationId, targetEnv);
                 }
             }
         }
@@ -345,166 +317,16 @@ public class ConfigurationComparisionFunction
 
     public ConfigurationComparisionFunction(ILogger<ConfigurationComparisionFunction> logger) => _logger = logger;
 
-    [Function("CompareDataverse")]
-    public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+    // HTTP trigger removed: CompareDataverse
+
+    private async Task<DiffReport> CompareSingleEntityAsync(ComparisonRequest request, string sourceToken, string targetToken, TokenCredential credential, Guid correlationId, bool skipExcelUpload = false)
     {
-        var correlationId = Guid.NewGuid();
-        _logger.LogInformation("[CompareDataverse] Start request CorrelationId={CorrelationId}", correlationId);
-        try
-        {
-            string body = await new System.IO.StreamReader(req.Body).ReadToEndAsync();
-            if (string.IsNullOrWhiteSpace(body))
-            {
-                _logger.LogWarning("[{CorrelationId}] Empty body", correlationId);
-                var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-                await bad.WriteStringAsync("Empty request body");
-                return bad;
-            }
+        _logger.LogInformation("[{CorrelationId}] Request Entity={Entity} Source={Source} Target={Target}", correlationId, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl);
 
-            var request = JsonSerializer.Deserialize<ComparisonRequest>(body, JsonOptions);
-            if (request == null || string.IsNullOrWhiteSpace(request.SourceEnvUrl) || string.IsNullOrWhiteSpace(request.TargetEnvUrl))
-            {
-                _logger.LogWarning("[{CorrelationId}] Invalid payload SourceEnvUrl='{SourceEnvUrl}' TargetEnvUrl='{TargetEnvUrl}'", correlationId, request?.SourceEnvUrl, request?.TargetEnvUrl);
-                var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-                await bad.WriteStringAsync("Invalid request payload");
-                return bad;
-            }
-
-            // If caller did not explicitly provide subgrid relationships or disable auto discovery, enable it by default
-            if (!request.AutoDiscoverSubgrids && (request.SubgridRelationships == null || request.SubgridRelationships.Count == 0))
-            {
-                request.AutoDiscoverSubgrids = true; // default behavior: discover subgrids and compare their records
-            }
-
-            var mode = string.IsNullOrWhiteSpace(request.Mode) ? "single" : request.Mode.Trim().ToLowerInvariant();
-            if (mode == "single")
-            {
-                if (string.IsNullOrWhiteSpace(request.EntityLogicalName))
-                {
-                    var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-                    await bad.WriteStringAsync("single mode requires 'EntityLogicalName'");
-                    return bad;
-                }
-            }
-            else if (mode == "list")
-            {
-                if (request.Entities == null || request.Entities.Count == 0)
-                {
-                    var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-                    await bad.WriteStringAsync("list mode requires 'Entities' array");
-                    return bad;
-                }
-            }
-            else
-            {
-                var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-                await bad.WriteStringAsync("Unsupported mode. Use 'single' or 'list'.");
-                return bad;
-            }
-
-            _logger.LogInformation("[{CorrelationId}] Request Mode={Mode} EntityOrCount={EntityOrCount} Source={Source} Target={Target} OutputContainer={Container} OutputFileName={FileName}", correlationId, mode, mode == "single" ? request.EntityLogicalName : (request.Entities?.Count.ToString() ?? "0"), request.SourceEnvUrl, request.TargetEnvUrl, request.OutputContainerName, request.OutputFileName);
-
-            var credential = new DefaultAzureCredential();
-
-            // Acquire or use provided tokens
-            string sourceToken = !string.IsNullOrWhiteSpace(request.SourceBearerToken)
-                ? request.SourceBearerToken.Trim()
-                : await AcquireSourceTokenAsync(request, credential);
-            if (!string.IsNullOrWhiteSpace(request.SourceBearerToken)) _logger.LogDebug("[{CorrelationId}] Using provided source bearer token length={Len}", correlationId, sourceToken.Length);
-            else _logger.LogInformation("[{CorrelationId}] Acquired source token", correlationId);
-
-            string targetToken = !string.IsNullOrWhiteSpace(request.TargetBearerToken)
-                ? request.TargetBearerToken.Trim()
-                : await AcquireTargetTokenAsync(request, credential);
-            if (!string.IsNullOrWhiteSpace(request.TargetBearerToken)) _logger.LogDebug("[{CorrelationId}] Using provided target bearer token length={Len}", correlationId, targetToken.Length);
-            else _logger.LogInformation("[{CorrelationId}] Acquired target token", correlationId);
-
-            // Acquire or use provided tokens ONCE and reuse per entity
-            _logger.LogInformation("[{CorrelationId}] Discovering mash_ fields", correlationId);
-            // Branch by mode
-            var singleSourceToken = sourceToken; var singleTargetToken = targetToken;
-            if (mode == "single")
-            {
-                var report = await CompareSingleEntityAsync(request, singleSourceToken, singleTargetToken, credential, correlationId);
-                string json = JsonSerializer.Serialize(report, JsonOptions);
-                var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-                response.Headers.Add("Content-Type", "application/json");
-                await response.WriteStringAsync(json);
-                return response;
-            }
-            else
-            {
-                var results = new List<(string Entity, DiffReport Report)>();
-                foreach (var entity in request.Entities)
-                {
-                    var original = request.EntityLogicalName;
-                    request.EntityLogicalName = entity;
-                    // Skip individual Excel uploads; aggregate later
-                    var report = await CompareSingleEntityAsync(request, singleSourceToken, singleTargetToken, credential, correlationId, skipExcelUpload: true);
-                    results.Add((entity, report));
-                    request.EntityLogicalName = original; // restore
-                }
-                // Build combined Excel if storage settings provided
-                string combinedBlobUrl = null;
-                try
-                {
-                    string storageUrl = request.StorageAccountUrl ?? Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL") ?? string.Empty;
-                    string containerName = request.OutputContainerName ?? Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER") ?? "comparissiontooloutput";
-                    byte[] excelBytes = BuildMultiEntityExcel(results, request.SourceEnvUrl, request.TargetEnvUrl, DateTime.UtcNow);
-                    _logger.LogInformation("[{CorrelationId}] Combined Excel size bytes={Size}", correlationId, excelBytes.Length);
-                    if (!string.IsNullOrWhiteSpace(request.StorageContainerSasUrl))
-                    {
-                        combinedBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, "multi", isCombined: true), containerSasUrl: request.StorageContainerSasUrl);
-                    }
-                    else if (!string.IsNullOrWhiteSpace(request.StorageConnectionString))
-                    {
-                        combinedBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, "multi", isCombined: true), connectionString: request.StorageConnectionString, containerName: containerName);
-                    }
-                    else if (!string.IsNullOrWhiteSpace(storageUrl))
-                    {
-                        var credential2 = new DefaultAzureCredential();
-                        combinedBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, "multi", isCombined: true), accountUrl: storageUrl, containerName: containerName, credential: credential2);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("[{CorrelationId}] No storage configuration provided; combined Excel not uploaded", correlationId);
-                    }
-                }
-                catch (Exception exUp)
-                {
-                    _logger.LogError(exUp, "[{CorrelationId}] Combined Excel upload failed", correlationId);
-                }
-
-                var payload = new
-                {
-                    Mode = mode,
-                    CombinedExcelBlobUrl = combinedBlobUrl,
-                    Results = results.Select(r => new { EntityLogicalName = r.Entity, Report = r.Report }).ToList()
-                };
-                string json = JsonSerializer.Serialize(payload, JsonOptions);
-                var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
-                response.Headers.Add("Content-Type", "application/json");
-                await response.WriteStringAsync(json);
-                return response;
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "[CompareDataverse] Unhandled error CorrelationId={CorrelationId}", correlationId);
-            var error = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
-            await error.WriteStringAsync("Error: " + ex.Message);
-            return error;
-        }
-    }
-
-    private async Task<DiffReport> CompareSingleEntityAsync(ComparisonRequest request, string sourceToken, string targetToken, DefaultAzureCredential credential, Guid correlationId, bool skipExcelUpload = false)
-    {
-        _logger.LogInformation("[{CorrelationId}] Request Entity={Entity} Source={Source} Target={Target} OutputContainer={Container} OutputFileName={FileName}", correlationId, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl, request.OutputContainerName, request.OutputFileName);
-
-        // Discover mash_ fields
-        _logger.LogInformation("[{CorrelationId}] Discovering mash_ fields", correlationId);
-        var sourceFieldTask = GetMashFieldsAsync(request.SourceEnvUrl, request.EntityLogicalName, sourceToken);
-        var targetFieldTask = GetMashFieldsAsync(request.TargetEnvUrl, request.EntityLogicalName, targetToken);
+        // Discover fields by configured prefix
+        _logger.LogInformation("[{CorrelationId}] Discovering prefixed fields", correlationId);
+        var sourceFieldTask = GetPrefixedFieldsAsync(request.SourceEnvUrl, request.EntityLogicalName, sourceToken);
+        var targetFieldTask = GetPrefixedFieldsAsync(request.TargetEnvUrl, request.EntityLogicalName, targetToken);
         await Task.WhenAll(sourceFieldTask, targetFieldTask);
         var sourceFields = sourceFieldTask.Result;
         var targetFields = targetFieldTask.Result;
@@ -573,8 +395,8 @@ public class ConfigurationComparisionFunction
         var report = new DiffReport { ComparedFields = fieldsToCompare, PrimaryNameAttribute = primaryNameAttribute };
         if (fieldsToCompare.Count == 0)
         {
-            report.Notes = "No mash_ prefixed fields found in both environments for the specified entity.";
-            _logger.LogWarning("[{CorrelationId}] No common mash_ fields", correlationId);
+            report.Notes = "No configured prefixed fields found in both environments for the specified entity.";
+            _logger.LogWarning("[{CorrelationId}] No common prefixed fields", correlationId);
         }
 
         // Fetch records using validated selectable fields (exclude pure formatted variants)
@@ -610,7 +432,7 @@ public class ConfigurationComparisionFunction
             {
                 foreach (var variant in formattedVariants)
                 {
-                    // variant.Key = formatted field logical name (e.g. mash_servicetypename), variant.Value = base field (mash_servicetype)
+                    // variant.Key = formatted field logical name (e.g. servicetypename), variant.Value = base field (servicetype)
                     var annotationKey = variant.Value + "@OData.Community.Display.V1.FormattedValue";
                     if (rec.TryGetValue(annotationKey, out var fmt))
                     {
@@ -624,8 +446,7 @@ public class ConfigurationComparisionFunction
             }
         }
         InjectFormattedValues(sourceRecords);
-        InjectFormattedValues(targetRecords);
-        _logger.LogInformation("[{CorrelationId}] Fetched SourceRecords={SourceRecords} TargetRecords={TargetRecords}", correlationId, sourceRecords.Count, targetRecords.Count);
+        InjectFormattedValues(targetRecords); // formatted values injected
 
         string pkField = request.EntityLogicalName + "id";
         var sourceMap = BuildRecordMap(sourceRecords, pkField);
@@ -671,6 +492,99 @@ public class ConfigurationComparisionFunction
         }
 
         _logger.LogInformation("[{CorrelationId}] Diff summary Matching={Matching} MismatchDetails={MismatchDetails} MultiFieldMismatches={MultiFieldMismatchCount} OnlyInSource={OnlySource} OnlyInTarget={OnlyTarget}", correlationId, report.MatchingRecordIds.Count, report.Mismatches.Count, report.MultiFieldMismatches.Count, report.OnlyInSource.Count, report.OnlyInTarget.Count);
+
+        // KEY-BASED COMPARISON (_K suffix results) - compare by primary name attribute
+        if (!string.IsNullOrWhiteSpace(primaryNameAttribute))
+        {
+            _logger.LogInformation("[{CorrelationId}] Starting key-based comparison using PrimaryNameAttribute='{PrimaryNameAttribute}'", correlationId, primaryNameAttribute);
+            var (sourceMapByKey, sourceSkippedCount) = BuildRecordMapByKey(sourceRecords, pkField, primaryNameAttribute);
+            var (targetMapByKey, targetSkippedCount) = BuildRecordMapByKey(targetRecords, pkField, primaryNameAttribute);
+            int totalSkipped = sourceSkippedCount + targetSkippedCount;
+            report.SkippedRecordsWithEmptyKey_K = totalSkipped;
+            
+            // Check if ALL records have empty primary key values (both source and target maps are empty but records exist)
+            bool allRecordsEmpty = (sourceRecords.Count > 0 || targetRecords.Count > 0) && sourceMapByKey.Count == 0 && targetMapByKey.Count == 0;
+            report.AllRecordsHaveEmptyPrimaryKey_K = allRecordsEmpty;
+            
+            if (allRecordsEmpty)
+            {
+                _logger.LogWarning("[{CorrelationId}] All records have empty primary key values for entity '{Entity}' - key-based comparison skipped", correlationId, request.EntityLogicalName);
+                report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + $"Key-based comparison: All {sourceRecords.Count + targetRecords.Count} records have empty primary key values.";
+            }
+            else
+            {
+                if (totalSkipped > 0)
+                {
+                    _logger.LogInformation("[{CorrelationId}] Skipped {SkippedCount} records with empty primary key values (Source={SourceSkipped}, Target={TargetSkipped})", correlationId, totalSkipped, sourceSkippedCount, targetSkippedCount);
+                }
+                _logger.LogDebug("[{CorrelationId}] Built key maps SourceMapByKey={SourceCount} TargetMapByKey={TargetCount}", correlationId, sourceMapByKey.Count, targetMapByKey.Count);
+
+            foreach (var kvp in sourceMapByKey)
+            {
+                var key = kvp.Key;
+                var (sourceId, sourceRecord) = kvp.Value;
+                if (!targetMapByKey.TryGetValue(key, out var targetEntry))
+                {
+                    report.OnlyInSource_K.Add(sourceRecord);
+                    continue;
+                }
+                var (targetId, targetRecord) = targetEntry;
+
+                int mismatchCountK = 0;
+                foreach (var field in fieldsToCompare)
+                {
+                    sourceRecord.TryGetValue(field, out var sVal);
+                    targetRecord.TryGetValue(field, out var tVal);
+                    if (!AreEqual(sVal, tVal))
+                    {
+                        mismatchCountK++;
+                        report.Mismatches_K.Add(new MismatchDetail_K
+                        {
+                            RecordKey = key,
+                            SourceRecordId = sourceId,
+                            TargetRecordId = targetId,
+                            FieldName = field,
+                            SourceValue = sVal,
+                            TargetValue = tVal
+                        });
+                    }
+                }
+                if (mismatchCountK == 0)
+                {
+                    report.MatchingRecordKeys_K.Add(key);
+                    report.MatchingRecordIdsByKey_K[key] = (sourceId, targetId);
+                }
+            }
+
+            foreach (var kvp in targetMapByKey)
+            {
+                if (!sourceMapByKey.ContainsKey(kvp.Key)) report.OnlyInTarget_K.Add(kvp.Value.Record);
+            }
+
+            // Build multi-field mismatches for key-based comparison
+            foreach (var group in report.Mismatches_K.GroupBy(m => m.RecordKey))
+            {
+                if (group.Count() > 1)
+                {
+                    var first = group.First();
+                    report.MultiFieldMismatches_K.Add(new MultiFieldMismatch_K
+                    {
+                        RecordKey = group.Key,
+                        SourceRecordId = first.SourceRecordId,
+                        TargetRecordId = first.TargetRecordId,
+                        FieldMismatches = group.ToList()
+                    });
+                }
+            }
+
+            _logger.LogInformation("[{CorrelationId}] Key-based diff summary Matching_K={Matching} Mismatches_K={Mismatches} MultiFieldMismatches_K={MultiField} OnlyInSource_K={OnlySource} OnlyInTarget_K={OnlyTarget} SkippedEmptyKeys={Skipped}", correlationId, report.MatchingRecordKeys_K.Count, report.Mismatches_K.Count, report.MultiFieldMismatches_K.Count, report.OnlyInSource_K.Count, report.OnlyInTarget_K.Count, totalSkipped);
+            }
+        }
+        else
+        {
+            _logger.LogWarning("[{CorrelationId}] Key-based comparison skipped - PrimaryNameAttribute not available for entity '{Entity}'", correlationId, request.EntityLogicalName);
+            report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Key-based comparison skipped (PrimaryNameAttribute not available).";
+        }
 
         // Subgrid comparisons
         if ((request.SubgridRelationships == null || request.SubgridRelationships.Count == 0) && request.AutoDiscoverSubgrids)
@@ -777,64 +691,19 @@ public class ConfigurationComparisionFunction
 
         if (!skipExcelUpload)
         {
-            // Excel upload (optional - single entity mode)
-            string storageUrl = request.StorageAccountUrl ?? Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL") ?? string.Empty;
-            string containerName = request.OutputContainerName ?? Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER") ?? "comparissiontooloutput";
-            if (!string.IsNullOrWhiteSpace(request.StorageContainerSasUrl))
+            // Simplified: only SAS upload supported
+            string blobNameMi = GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, request.EntityLogicalName);
+            var excelBytesMi = BuildExcel(report, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl, DateTime.UtcNow);
+            var miUrl = await TryUploadWithManagedIdentityAsync(excelBytesMi, blobNameMi);
+            if (!string.IsNullOrWhiteSpace(miUrl))
             {
-                _logger.LogInformation("[{CorrelationId}] Using SAS URL for upload", correlationId);
-                try
-                {
-                    string blobName = GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, request.EntityLogicalName);
-                    var excelBytes = BuildExcel(report, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl, DateTime.UtcNow);
-                    _logger.LogDebug("[{CorrelationId}] Excel size bytes={Size}", correlationId, excelBytes.Length);
-                    report.ExcelBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, containerSasUrl: request.StorageContainerSasUrl);
-                    _logger.LogInformation("[{CorrelationId}] Excel uploaded via SAS BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
-                }
-                catch (Exception upEx)
-                {
-                    _logger.LogError(upEx, "[{CorrelationId}] Excel upload failed (SAS)", correlationId);
-                    report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Excel upload failed (SAS): " + upEx.Message;
-                }
-            }
-            else if (!string.IsNullOrWhiteSpace(request.StorageConnectionString))
-            {
-                _logger.LogInformation("[{CorrelationId}] Using connection string for upload", correlationId);
-                try
-                {
-                    string blobName = GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, request.EntityLogicalName);
-                    var excelBytes = BuildExcel(report, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl, DateTime.UtcNow);
-                    _logger.LogDebug("[{CorrelationId}] Excel size bytes={Size}", correlationId, excelBytes.Length);
-                    report.ExcelBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, connectionString: request.StorageConnectionString, containerName: containerName);
-                    _logger.LogInformation("[{CorrelationId}] Excel uploaded via connection string BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
-                }
-                catch (Exception upEx)
-                {
-                    _logger.LogError(upEx, "[{CorrelationId}] Excel upload failed (ConnStr)", correlationId);
-                    report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Excel upload failed (ConnStr): " + upEx.Message;
-                }
-            }
-            else if (!string.IsNullOrWhiteSpace(storageUrl))
-            {
-                _logger.LogInformation("[{CorrelationId}] Using managed identity for upload AccountUrl={AccountUrl} Container={Container}", correlationId, storageUrl, containerName);
-                try
-                {
-                    string blobName = GenerateBlobName(request.SourceEnvUrl, request.TargetEnvUrl, request.EntityLogicalName);
-                    var excelBytes = BuildExcel(report, request.EntityLogicalName, request.SourceEnvUrl, request.TargetEnvUrl, DateTime.UtcNow);
-                    _logger.LogDebug("[{CorrelationId}] Excel size bytes={Size}", correlationId, excelBytes.Length);
-                    report.ExcelBlobUrl = await UploadExcelWithFlexibleAuthAsync(excelBytes, blobName, accountUrl: storageUrl, containerName: containerName, credential: credential);
-                    _logger.LogInformation("[{CorrelationId}] Excel uploaded via identity BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
-                }
-                catch (Exception upEx)
-                {
-                    _logger.LogError(upEx, "[{CorrelationId}] Excel upload failed (Identity)", correlationId);
-                    report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Excel upload failed (Identity): " + upEx.Message;
-                }
+                report.ExcelBlobUrl = miUrl;
+                _logger.LogInformation("[{CorrelationId}] Excel uploaded via MI BlobUrl={BlobUrl}", correlationId, report.ExcelBlobUrl);
             }
             else
             {
-                _logger.LogWarning("[{CorrelationId}] No storage configuration provided; Excel skipped", correlationId);
-                report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "No storage configuration provided; Excel not generated.";
+                _logger.LogWarning("[{CorrelationId}] Excel not uploaded (Managed Identity storage config missing)", correlationId);
+                report.Notes += (string.IsNullOrEmpty(report.Notes) ? string.Empty : " ") + "Managed Identity storage config missing; Excel not uploaded.";
             }
         }
 
@@ -970,6 +839,160 @@ public class ConfigurationComparisionFunction
         }
         onlyTgtWs.Columns().AdjustToContents();
 
+        // KEY-BASED COMPARISON AGGREGATED SHEETS (_K suffix)
+        // Summary_K sheet
+        var summaryK = wb.Worksheets.Add("Summary_K");
+        summaryK.Cell(1,1).Value = "Source Env";
+        summaryK.Cell(1,2).Value = "Target Env";
+        summaryK.Cell(1,3).Value = "Comparission Date and Time";
+        summaryK.Cell(1,4).Value = "Entity";
+        summaryK.Cell(1,5).Value = "Primary Key Field";
+        summaryK.Cell(1,6).Value = "Compared Fields";
+        summaryK.Cell(1,7).Value = "Matching Records";
+        summaryK.Cell(1,8).Value = "Mismatches";
+        summaryK.Cell(1,9).Value = "Only In Source";
+        summaryK.Cell(1,10).Value = "Only In Target";
+        summaryK.Cell(1,11).Value = "Skipped (Empty Key)";
+        summaryK.Cell(1,12).Value = "Notes";
+        int srK = 2;
+        foreach (var (Entity, Report) in results)
+        {
+            summaryK.Cell(srK,1).Value = sourceEnvUrl;
+            summaryK.Cell(srK,2).Value = targetEnvUrl;
+            summaryK.Cell(srK,3).Value = comparisonTimestampUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+            summaryK.Cell(srK,4).Value = Entity;
+            summaryK.Cell(srK,5).Value = Report.PrimaryNameAttribute ?? string.Empty;
+            summaryK.Cell(srK,6).Value = Truncate(string.Join(',', Report.ComparedFields));
+            summaryK.Cell(srK,7).Value = Report.MatchingRecordKeys_K.Count;
+            summaryK.Cell(srK,8).Value = Report.Mismatches_K.Count;
+            summaryK.Cell(srK,9).Value = Report.OnlyInSource_K.Count;
+            summaryK.Cell(srK,10).Value = Report.OnlyInTarget_K.Count;
+            summaryK.Cell(srK,11).Value = Report.SkippedRecordsWithEmptyKey_K;
+            string notesK = string.IsNullOrWhiteSpace(Report.PrimaryNameAttribute) 
+                ? "Key-based comparison skipped" 
+                : (Report.AllRecordsHaveEmptyPrimaryKey_K ? "All records have empty primary key values" : string.Empty);
+            summaryK.Cell(srK,12).Value = notesK;
+            // Highlight row in red if all records have empty primary key values
+            if (Report.AllRecordsHaveEmptyPrimaryKey_K)
+            {
+                summaryK.Row(srK).Style.Fill.BackgroundColor = XLColor.Red;
+                summaryK.Row(srK).Style.Font.FontColor = XLColor.White;
+            }
+            srK++;
+        }
+        summaryK.Columns().AdjustToContents();
+
+        // MatchingRecords_K sheet
+        var matchWsK = wb.Worksheets.Add("MatchingRecords_K");
+        matchWsK.Cell(1,1).Value = "Entity";
+        matchWsK.Cell(1,2).Value = "RecordKey";
+        matchWsK.Cell(1,3).Value = "SourceRecordId";
+        matchWsK.Cell(1,4).Value = "TargetRecordId";
+        matchWsK.Cell(1,5).Value = "SourceRecordUrl";
+        matchWsK.Cell(1,6).Value = "TargetRecordUrl";
+        int mrK = 2;
+        foreach (var (Entity, Report) in results)
+        {
+            foreach (var key in Report.MatchingRecordKeys_K)
+            {
+                if (Report.MatchingRecordIdsByKey_K.TryGetValue(key, out var ids))
+                {
+                    matchWsK.Cell(mrK,1).Value = Entity;
+                    matchWsK.Cell(mrK,2).Value = Truncate(key);
+                    matchWsK.Cell(mrK,3).Value = ids.SourceId.ToString();
+                    matchWsK.Cell(mrK,4).Value = ids.TargetId.ToString();
+                    matchWsK.Cell(mrK,5).Value = BuildRecordUrl(sourceEnvUrl, Entity, ids.SourceId);
+                    matchWsK.Cell(mrK,6).Value = BuildRecordUrl(targetEnvUrl, Entity, ids.TargetId);
+                    mrK++;
+                }
+            }
+        }
+        matchWsK.Columns().AdjustToContents();
+
+        // Mismatches_K sheet
+        var mismatchWsK = wb.Worksheets.Add("Mismatches_K");
+        mismatchWsK.Cell(1,1).Value = "Entity";
+        mismatchWsK.Cell(1,2).Value = "RecordKey";
+        mismatchWsK.Cell(1,3).Value = "SourceRecordId";
+        mismatchWsK.Cell(1,4).Value = "TargetRecordId";
+        mismatchWsK.Cell(1,5).Value = "SourceRecordUrl";
+        mismatchWsK.Cell(1,6).Value = "TargetRecordUrl";
+        mismatchWsK.Cell(1,7).Value = "FieldName";
+        mismatchWsK.Cell(1,8).Value = "SourceValue";
+        mismatchWsK.Cell(1,9).Value = "TargetValue";
+        int mmrK = 2;
+        foreach (var (Entity, Report) in results)
+        {
+            foreach (var m in Report.Mismatches_K)
+            {
+                mismatchWsK.Cell(mmrK,1).Value = Entity;
+                mismatchWsK.Cell(mmrK,2).Value = Truncate(m.RecordKey);
+                mismatchWsK.Cell(mmrK,3).Value = m.SourceRecordId?.ToString() ?? string.Empty;
+                mismatchWsK.Cell(mmrK,4).Value = m.TargetRecordId?.ToString() ?? string.Empty;
+                mismatchWsK.Cell(mmrK,5).Value = m.SourceRecordId.HasValue ? BuildRecordUrl(sourceEnvUrl, Entity, m.SourceRecordId.Value) : string.Empty;
+                mismatchWsK.Cell(mmrK,6).Value = m.TargetRecordId.HasValue ? BuildRecordUrl(targetEnvUrl, Entity, m.TargetRecordId.Value) : string.Empty;
+                mismatchWsK.Cell(mmrK,7).Value = m.FieldName;
+                mismatchWsK.Cell(mmrK,8).Value = Truncate(m.SourceValue?.ToString());
+                mismatchWsK.Cell(mmrK,9).Value = Truncate(m.TargetValue?.ToString());
+                mmrK++;
+            }
+        }
+        mismatchWsK.Columns().AdjustToContents();
+
+        // OnlyInSource_K sheet
+        var onlySrcWsK = wb.Worksheets.Add("OnlyInSource_K");
+        onlySrcWsK.Cell(1,1).Value = "Entity";
+        onlySrcWsK.Cell(1,2).Value = "RecordKey";
+        onlySrcWsK.Cell(1,3).Value = "RecordId";
+        onlySrcWsK.Cell(1,4).Value = "SourceRecordUrl";
+        int osrK = 2;
+        foreach (var (Entity, Report) in results)
+        {
+            string pk = Entity + "id";
+            var primaryNameAttr = Report.PrimaryNameAttribute ?? string.Empty;
+            foreach (var rec in Report.OnlyInSource_K)
+            {
+                string? keyVal = null;
+                if (!string.IsNullOrWhiteSpace(primaryNameAttr) && rec.TryGetValue(primaryNameAttr, out var kv) && kv != null)
+                    keyVal = kv.ToString()?.Trim();
+                rec.TryGetValue(pk, out var idVal);
+                Guid.TryParse(idVal?.ToString(), out var gid);
+                onlySrcWsK.Cell(osrK,1).Value = Entity;
+                onlySrcWsK.Cell(osrK,2).Value = Truncate(keyVal ?? string.Empty);
+                onlySrcWsK.Cell(osrK,3).Value = gid != Guid.Empty ? gid.ToString() : string.Empty;
+                onlySrcWsK.Cell(osrK,4).Value = gid != Guid.Empty ? BuildRecordUrl(sourceEnvUrl, Entity, gid) : string.Empty;
+                osrK++;
+            }
+        }
+        onlySrcWsK.Columns().AdjustToContents();
+
+        // OnlyInTarget_K sheet
+        var onlyTgtWsK = wb.Worksheets.Add("OnlyInTarget_K");
+        onlyTgtWsK.Cell(1,1).Value = "Entity";
+        onlyTgtWsK.Cell(1,2).Value = "RecordKey";
+        onlyTgtWsK.Cell(1,3).Value = "RecordId";
+        onlyTgtWsK.Cell(1,4).Value = "TargetRecordUrl";
+        int otrK = 2;
+        foreach (var (Entity, Report) in results)
+        {
+            string pk = Entity + "id";
+            var primaryNameAttr = Report.PrimaryNameAttribute ?? string.Empty;
+            foreach (var rec in Report.OnlyInTarget_K)
+            {
+                string? keyVal = null;
+                if (!string.IsNullOrWhiteSpace(primaryNameAttr) && rec.TryGetValue(primaryNameAttr, out var kv) && kv != null)
+                    keyVal = kv.ToString()?.Trim();
+                rec.TryGetValue(pk, out var idVal);
+                Guid.TryParse(idVal?.ToString(), out var gid);
+                onlyTgtWsK.Cell(otrK,1).Value = Entity;
+                onlyTgtWsK.Cell(otrK,2).Value = Truncate(keyVal ?? string.Empty);
+                onlyTgtWsK.Cell(otrK,3).Value = gid != Guid.Empty ? gid.ToString() : string.Empty;
+                onlyTgtWsK.Cell(otrK,4).Value = gid != Guid.Empty ? BuildRecordUrl(targetEnvUrl, Entity, gid) : string.Empty;
+                otrK++;
+            }
+        }
+        onlyTgtWsK.Columns().AdjustToContents();
+
         // Child diff sheets remain per entity to avoid overly large aggregation
         foreach (var (Entity, Report) in results)
         {
@@ -1015,103 +1038,40 @@ public class ConfigurationComparisionFunction
     }
 
     // Build combined workbook for multiple entities (list mode) with prefixed sheet names per entity
-    private static byte[] BuildCombinedExcel(List<(string EntityLogicalName, DiffReport Report)> results, string sourceEnvUrl, string targetEnvUrl, DateTime utcNow)
+    // (Removed unused BuildCombinedExcel method)
+
+    // Managed Identity helpers
+    private static ManagedIdentityCredential? GetManagedIdentityCredential()
     {
-        using var wb = new XLWorkbook();
-        // Global summary sheet
-        var summary = wb.Worksheets.Add("Summary");
-        summary.Cell(1,1).Value = "Entity";
-        summary.Cell(1,2).Value = "ComparedFields";
-        summary.Cell(1,3).Value = "MatchingRecords";
-        summary.Cell(1,4).Value = "Mismatches";
-        summary.Cell(1,5).Value = "OnlyInSource";
-        summary.Cell(1,6).Value = "OnlyInTarget";
-        summary.Cell(1,7).Value = "Notes";
-        int sr = 2;
-        foreach (var item in results)
+        // Use User Assigned Managed Identity client ID from env var MANAGED_IDENTITY_CLIENT_ID
+        var clientId = Environment.GetEnvironmentVariable("MANAGED_IDENTITY_CLIENT_ID")?.Trim();
+        if (string.IsNullOrWhiteSpace(clientId)) return null;
+        return new ManagedIdentityCredential(clientId: clientId);
+    }
+
+    private static string? GetManagedStorageContainerUrl()
+    {
+        // Full container URL without SAS; e.g. https://acct.blob.core.windows.net/container
+        return Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONTAINER_URL");
+    }
+
+    private static async Task<string?> TryUploadWithManagedIdentityAsync(byte[] bytes, string blobName)
+    {
+        try
         {
-            summary.Cell(sr,1).Value = item.EntityLogicalName;
-            summary.Cell(sr,2).Value = string.Join(',', item.Report.ComparedFields);
-            summary.Cell(sr,3).Value = item.Report.MatchingRecordIds.Count;
-            summary.Cell(sr,4).Value = item.Report.Mismatches.Count;
-            summary.Cell(sr,5).Value = item.Report.OnlyInSource.Count;
-            summary.Cell(sr,6).Value = item.Report.OnlyInTarget.Count;
-            summary.Cell(sr,7).Value = item.Report.Notes;
-            sr++;
+            // Storage uses a different user-assigned MI
+            var storageClientId = Environment.GetEnvironmentVariable("STORAGE_MANAGED_IDENTITY_CLIENT_ID")?.Trim();
+            var miCred = string.IsNullOrWhiteSpace(storageClientId) ? null : new ManagedIdentityCredential(clientId: storageClientId);
+            var containerUrl = GetManagedStorageContainerUrl();
+            if (miCred == null || string.IsNullOrWhiteSpace(containerUrl)) return null;
+            var containerClient = new BlobContainerClient(new Uri(containerUrl!), miCred);
+            // Store directly in container (no directory prefix)
+            using var ms = new System.IO.MemoryStream(bytes);
+            var blob = containerClient.GetBlobClient(blobName);
+            await blob.UploadAsync(ms, overwrite: true);
+            return blob.Uri.ToString();
         }
-        summary.Columns().AdjustToContents();
-
-        // Per-entity detailed sheets (similar to BuildExcel but prefixed)
-        foreach (var item in results)
-        {
-            var entity = item.EntityLogicalName;
-            var report = item.Report;
-            string prefix = entity + "_"; // sheet name prefix
-            // Matching records
-            var matchWs = wb.Worksheets.Add(prefix + "MatchingRecords");
-            matchWs.Cell(1,1).Value = "Entity";
-            matchWs.Cell(1,2).Value = "RecordId";
-            matchWs.Cell(1,3).Value = "SourceRecordUrl";
-            matchWs.Cell(1,4).Value = "TargetRecordUrl";
-            for (int i=0;i<report.MatchingRecordIds.Count;i++)
-            {
-                var id = report.MatchingRecordIds[i];
-                matchWs.Cell(i+2,1).Value = entity;
-                matchWs.Cell(i+2,2).Value = id.ToString();
-                matchWs.Cell(i+2,3).Value = sourceEnvUrl.TrimEnd('/') + $"/main.aspx?etn={entity}&id={id}&pagetype=entityrecord";
-                matchWs.Cell(i+2,4).Value = targetEnvUrl.TrimEnd('/') + $"/main.aspx?etn={entity}&id={id}&pagetype=entityrecord";
-            }
-            matchWs.Columns().AdjustToContents();
-
-            var mismatchWs = wb.Worksheets.Add(prefix + "Mismatches");
-            mismatchWs.Cell(1,1).Value = "Entity";
-            mismatchWs.Cell(1,2).Value = "RecordId";
-            mismatchWs.Cell(1,3).Value = "SourceRecordUrl";
-            mismatchWs.Cell(1,4).Value = "TargetRecordUrl";
-            mismatchWs.Cell(1,5).Value = "FieldName";
-            mismatchWs.Cell(1,6).Value = "SourceValue";
-            mismatchWs.Cell(1,7).Value = "TargetValue";
-            int r = 2;
-            foreach (var mm in report.Mismatches)
-            {
-                mismatchWs.Cell(r,1).Value = entity;
-                mismatchWs.Cell(r,2).Value = mm.RecordId.ToString();
-                mismatchWs.Cell(r,3).Value = sourceEnvUrl.TrimEnd('/') + $"/main.aspx?etn={entity}&id={mm.RecordId}&pagetype=entityrecord";
-                mismatchWs.Cell(r,4).Value = targetEnvUrl.TrimEnd('/') + $"/main.aspx?etn={entity}&id={mm.RecordId}&pagetype=entityrecord";
-                mismatchWs.Cell(r,5).Value = mm.FieldName;
-                mismatchWs.Cell(r,6).Value = mm.SourceValue?.ToString();
-                mismatchWs.Cell(r,7).Value = mm.TargetValue?.ToString();
-                r++;
-            }
-            mismatchWs.Columns().AdjustToContents();
-
-            void WriteRecordList(string sheetSuffix, List<Dictionary<string, object?>> records, bool isSource)
-            {
-                var ws = wb.Worksheets.Add(prefix + sheetSuffix);
-                ws.Cell(1,1).Value = "Entity";
-                ws.Cell(1,2).Value = "RecordId";
-                ws.Cell(1,3).Value = isSource ? "SourceRecordUrl" : "TargetRecordUrl";
-                string pk = entity + "id";
-                int row = 2;
-                foreach (var rec in records)
-                {
-                    if (rec.TryGetValue(pk, out var idVal) && Guid.TryParse(idVal?.ToString(), out var gid))
-                    {
-                        ws.Cell(row,1).Value = entity;
-                        ws.Cell(row,2).Value = gid.ToString();
-                        ws.Cell(row,3).Value = (isSource?sourceEnvUrl:targetEnvUrl).TrimEnd('/') + $"/main.aspx?etn={entity}&id={gid}&pagetype=entityrecord";
-                        row++;
-                    }
-                }
-                ws.Columns().AdjustToContents();
-            }
-            if (report.OnlyInSource.Count>0) WriteRecordList("OnlyInSource", report.OnlyInSource, true);
-            if (report.OnlyInTarget.Count>0) WriteRecordList("OnlyInTarget", report.OnlyInTarget, false);
-        }
-
-        using var ms = new System.IO.MemoryStream();
-        wb.SaveAs(ms);
-        return ms.ToArray();
+        catch { return null; }
     }
 
     // Discover one-to-many relationships for the parent entity and populate SubgridRelationships if empty
@@ -1237,7 +1197,7 @@ public class ConfigurationComparisionFunction
         return result.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
 
-    // Populate childFields (if empty) with mash_ intersection and validate parent lookup field existence via metadata
+    // Populate childFields (if empty) with prefix intersection and validate parent lookup field existence via metadata
     private async Task EnrichSubgridRelationshipsAsync(ComparisonRequest request, string sourceToken, string targetToken, Guid correlationId)
     {
         foreach (var rel in request.SubgridRelationships)
@@ -1248,14 +1208,14 @@ public class ConfigurationComparisionFunction
             {
                 try
                 {
-                    var sourceChildFieldsTask = GetMashFieldsAsync(request.SourceEnvUrl, rel.ChildEntityLogicalName, sourceToken);
-                    var targetChildFieldsTask = GetMashFieldsAsync(request.TargetEnvUrl, rel.ChildEntityLogicalName, targetToken);
+                    var sourceChildFieldsTask = GetPrefixedFieldsAsync(request.SourceEnvUrl, rel.ChildEntityLogicalName, sourceToken);
+                    var targetChildFieldsTask = GetPrefixedFieldsAsync(request.TargetEnvUrl, rel.ChildEntityLogicalName, targetToken);
                     await Task.WhenAll(sourceChildFieldsTask, targetChildFieldsTask);
                     var sourceChildFields = sourceChildFieldsTask.Result;
                     var targetChildFields = targetChildFieldsTask.Result;
                     var intersection = sourceChildFields.Intersect(targetChildFields, StringComparer.OrdinalIgnoreCase)
                         .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-                    // Normalize: remove formatted display variants (ending in 'name' or 'typename') when base exists (e.g. mash_areaname -> mash_area)
+                    // Normalize: remove formatted display variants (ending in 'name' or 'typename') when base exists (e.g. areaname -> area)
                     var baseSet = new HashSet<string>(intersection, StringComparer.OrdinalIgnoreCase);
                     var normalized = new List<string>();
                     foreach (var f in intersection)
@@ -1270,7 +1230,7 @@ public class ConfigurationComparisionFunction
                         }
                         normalized.Add(f);
                     }
-                    // Validate selectability of each normalized child field against API (avoid requesting non-existent properties like mash_areaname)
+                    // Validate selectability of each normalized child field against API (avoid requesting non-existent formatted-only properties like <prefix>areaname)
                     var selectable = new List<string>();
                     foreach (var f in normalized)
                     {
@@ -1320,7 +1280,7 @@ public class ConfigurationComparisionFunction
             if (rel.ChildFields == null || rel.ChildFields.Count == 0)
             {
                 rel.ParentLookupFieldValid = false;
-                _logger.LogDebug("[{CorrelationId}] Child entity '{ChildEntity}' has zero selectable mash_ fields after normalization - relation marked invalid", correlationId, rel.ChildEntityLogicalName);
+                _logger.LogDebug("[{CorrelationId}] Child entity '{ChildEntity}' has zero selectable prefixed fields after normalization - relation marked invalid", correlationId, rel.ChildEntityLogicalName);
             }
         }
     }
@@ -1351,8 +1311,15 @@ public class ConfigurationComparisionFunction
         catch { return false; }
     }
 
-    private static async Task<string> AcquireSourceTokenAsync(ComparisonRequest request, DefaultAzureCredential fallbackCredential)
+    private static async Task<string> AcquireSourceTokenAsync(ComparisonRequest request, TokenCredential fallbackCredential)
     {
+        // Prefer Managed Identity if configured
+        var miCred = GetManagedIdentityCredential();
+        if (miCred != null)
+        {
+            var miToken = await miCred.GetTokenAsync(new TokenRequestContext(new[] { request.SourceEnvUrl.TrimEnd('/') + "/.default" }), System.Threading.CancellationToken.None);
+            return miToken.Token;
+        }
         if (!string.IsNullOrWhiteSpace(request.SourceTokenGenerationEndpoint) && !string.IsNullOrWhiteSpace(request.SourceAppClientId) && !string.IsNullOrWhiteSpace(request.SourceResourceTenantId) && !string.IsNullOrWhiteSpace(request.SourceMiClientId))
         {
             string scope = string.IsNullOrWhiteSpace(request.SourceScope) ? request.SourceEnvUrl.TrimEnd('/') + "/.default" : request.SourceScope;
@@ -1362,12 +1329,19 @@ public class ConfigurationComparisionFunction
             resp.EnsureSuccessStatusCode();
             return ParseTokenResponse(await resp.Content.ReadAsStringAsync());
         }
-        var token = await fallbackCredential.GetTokenAsync(new TokenRequestContext(new[] { request.SourceEnvUrl.TrimEnd('/') + "/.default" }));
-        return token.Token;
+        var fbToken = await fallbackCredential.GetTokenAsync(new TokenRequestContext(new[] { request.SourceEnvUrl.TrimEnd('/') + "/.default" }), System.Threading.CancellationToken.None);
+        return fbToken.Token;
     }
 
-    private static async Task<string> AcquireTargetTokenAsync(ComparisonRequest request, DefaultAzureCredential fallbackCredential)
+    private static async Task<string> AcquireTargetTokenAsync(ComparisonRequest request, TokenCredential fallbackCredential)
     {
+        // Prefer Managed Identity if configured
+        var miCred2 = GetManagedIdentityCredential();
+        if (miCred2 != null)
+        {
+            var miToken2 = await miCred2.GetTokenAsync(new TokenRequestContext(new[] { request.TargetEnvUrl.TrimEnd('/') + "/.default" }), System.Threading.CancellationToken.None);
+            return miToken2.Token;
+        }
         if (!string.IsNullOrWhiteSpace(request.TokenGenerationEndpoint) && !string.IsNullOrWhiteSpace(request.AppClientId) && !string.IsNullOrWhiteSpace(request.ResourceTenantId) && !string.IsNullOrWhiteSpace(request.MiClientId))
         {
             string scope = string.IsNullOrWhiteSpace(request.Scope) ? request.TargetEnvUrl.TrimEnd('/') + "/.default" : request.Scope;
@@ -1377,8 +1351,8 @@ public class ConfigurationComparisionFunction
             resp.EnsureSuccessStatusCode();
             return ParseTokenResponse(await resp.Content.ReadAsStringAsync());
         }
-        var token = await fallbackCredential.GetTokenAsync(new TokenRequestContext(new[] { request.TargetEnvUrl.TrimEnd('/') + "/.default" }));
-        return token.Token;
+        var fbToken2 = await fallbackCredential.GetTokenAsync(new TokenRequestContext(new[] { request.TargetEnvUrl.TrimEnd('/') + "/.default" }), System.Threading.CancellationToken.None);
+        return fbToken2.Token;
     }
 
     private static string ParseTokenResponse(string raw)
@@ -1393,13 +1367,34 @@ public class ConfigurationComparisionFunction
         return raw.Trim().Trim('"');
     }
 
-    private static async Task<List<string>> GetMashFieldsAsync(string envUrl, string entityLogicalName, string accessToken)
+    // Resolve field prefix for an entity from environment variables.
+    // CONFIG_FIELD_PREFIX_DEFAULT: global default
+    // CONFIG_FIELD_PREFIX_{ENTITY}: per-entity override
+    // Returns empty string if no prefix configured (triggers all-fields comparison mode)
+    private static string GetFieldPrefixForEntity(string entityLogicalName)
+    {
+        var globalPrefix = Environment.GetEnvironmentVariable("CONFIG_FIELD_PREFIX_DEFAULT")?.Trim();
+        var perEntityVar = "CONFIG_FIELD_PREFIX_" + (entityLogicalName ?? string.Empty).Trim();
+        var perEntityPrefix = Environment.GetEnvironmentVariable(perEntityVar)?.Trim();
+        var prefix = string.IsNullOrWhiteSpace(perEntityPrefix) ? globalPrefix : perEntityPrefix;
+        // Normalize: ensure non-empty (empty string triggers all-fields mode)
+        return string.IsNullOrWhiteSpace(prefix) ? string.Empty : prefix;
+    }
+
+    // Get attributes whose logical names start with the configured prefix for the entity
+    // If prefix is empty or not configured, ALL fields are returned (all-fields comparison mode)
+    private static async Task<List<string>> GetPrefixedFieldsAsync(string envUrl, string entityLogicalName, string accessToken)
     {
         var client = new HttpClient();
         client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
         client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
         string? url = envUrl.TrimEnd('/') + $"/api/data/v9.2/EntityDefinitions(LogicalName='{entityLogicalName}')/Attributes?$select=LogicalName";
         var result = new List<string>();
+        var prefix = GetFieldPrefixForEntity(entityLogicalName);
+        
+        // Log comparison mode
+        var comparisonMode = string.IsNullOrWhiteSpace(prefix) ? "ALL FIELDS" : $"PREFIXED ('{prefix}')";
+        
         try
         {
             while (!string.IsNullOrEmpty(url))
@@ -1416,7 +1411,18 @@ public class ConfigurationComparisionFunction
                         if (item.TryGetProperty("LogicalName", out var ln))
                         {
                             var name = ln.GetString();
-                            if (!string.IsNullOrWhiteSpace(name) && name.StartsWith("mash_", StringComparison.OrdinalIgnoreCase)) result.Add(name);
+                            if (!string.IsNullOrWhiteSpace(name))
+                            {
+                                if (string.IsNullOrWhiteSpace(prefix))
+                                {
+                                    // No prefix configured: include all attributes (ALL-FIELDS MODE)
+                                    result.Add(name);
+                                }
+                                else if (name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    result.Add(name);
+                                }
+                            }
                         }
                     }
                 }
@@ -1424,7 +1430,18 @@ public class ConfigurationComparisionFunction
             }
         }
         catch { }
-        return result.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        
+        var distinctResult = result.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        
+        // Log results with mode indication and performance warning if in all-fields mode
+        Console.WriteLine($"[Field Discovery] Entity='{entityLogicalName}' Mode={comparisonMode} FieldCount={distinctResult.Count}");
+        
+        if (string.IsNullOrWhiteSpace(prefix) && distinctResult.Count > 50)
+        {
+            Console.WriteLine($"[PERFORMANCE WARNING] Entity='{entityLogicalName}' comparing ALL {distinctResult.Count} fields. This may be slow and could trigger API throttling. Consider configuring CONFIG_FIELD_PREFIX_DEFAULT or CONFIG_FIELD_PREFIX_{entityLogicalName} to limit fields.");
+        }
+        
+        return distinctResult;
     }
 
     private static async Task<List<Dictionary<string, object?>>> FetchAllRecordsAsync(ILogger logger, string envUrl, string entityLogicalName, IEnumerable<string> fields, string accessToken, bool onlyActive, Guid correlationId, string? primaryNameAttribute)
@@ -1568,6 +1585,37 @@ public class ConfigurationComparisionFunction
         return dict;
     }
 
+    // Build record map keyed by primary name attribute value (for key-based comparison)
+    // Returns the map and count of records skipped due to empty/null key values
+    private static (Dictionary<string, (Guid Id, Dictionary<string, object?> Record)> Map, int SkippedCount) BuildRecordMapByKey(List<Dictionary<string, object?>> records, string pkField, string keyField)
+    {
+        var dict = new Dictionary<string, (Guid Id, Dictionary<string, object?> Record)>(StringComparer.OrdinalIgnoreCase);
+        int skippedCount = 0;
+        foreach (var record in records)
+        {
+            if (!record.TryGetValue(pkField, out var idObj) || idObj == null || !Guid.TryParse(idObj.ToString(), out var id)) continue;
+            if (!record.TryGetValue(keyField, out var keyObj) || keyObj == null)
+            {
+                skippedCount++;
+                continue;
+            }
+            var keyValue = keyObj.ToString();
+            if (string.IsNullOrWhiteSpace(keyValue))
+            {
+                skippedCount++;
+                continue;
+            }
+            // Normalize key: trim whitespace and use as-is (case-insensitive via dictionary comparer)
+            var normalizedKey = keyValue.Trim();
+            // If duplicate key exists, skip (first occurrence wins)
+            if (!dict.ContainsKey(normalizedKey))
+            {
+                dict[normalizedKey] = (id, record);
+            }
+        }
+        return (dict, skippedCount);
+    }
+
     private static Dictionary<string, object?> ToDictionary(JsonElement element)
     {
         var dict = new Dictionary<string, object?>();
@@ -1598,14 +1646,15 @@ public class ConfigurationComparisionFunction
         // Guid comparison
         if (Guid.TryParse(a.ToString(), out var ga) && Guid.TryParse(b.ToString(), out var gb)) return ga.Equals(gb);
 
-        // String normalization: trim and collapse internal whitespace; case-insensitive
+        // String normalization: trim all whitespace (including tabs, newlines, non-breaking spaces) and collapse internal whitespace; case-insensitive
         static string NormalizeString(string s)
         {
-            // Trim and collapse multiple spaces to single space
-            var trimmed = s.Trim();
-            if (trimmed.Length == 0) return string.Empty;
-            var parts = trimmed.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            return string.Join(' ', parts).ToLowerInvariant();
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            // Use Regex to replace all whitespace characters (space, tab, newline, carriage return, non-breaking space, etc.) with a single space
+            // Then trim and collapse multiple spaces to single space
+            var normalized = Regex.Replace(s, @"\s+", " ").Trim();
+            if (normalized.Length == 0) return string.Empty;
+            return normalized.ToLowerInvariant();
         }
 
         if (a is string || b is string)
@@ -1731,6 +1780,133 @@ public class ConfigurationComparisionFunction
         WriteRecordIdOnly("OnlyInSource", report.OnlyInSource, true);
         WriteRecordIdOnly("OnlyInTarget", report.OnlyInTarget, false);
 
+        // KEY-BASED COMPARISON SHEETS (_K suffix)
+        var primaryNameAttr = report.PrimaryNameAttribute ?? string.Empty;
+        
+        // Summary_K sheet
+        var summaryK = wb.Worksheets.Add("Summary_K");
+        summaryK.Cell(1, 1).Value = "Source Env";
+        summaryK.Cell(1, 2).Value = "Target Env";
+        summaryK.Cell(1, 3).Value = "Comparission Date and Time";
+        summaryK.Cell(1, 4).Value = "Entity";
+        summaryK.Cell(1, 5).Value = "Primary Key Field";
+        summaryK.Cell(1, 6).Value = "Compared Fields";
+        summaryK.Cell(1, 7).Value = "Matching Records";
+        summaryK.Cell(1, 8).Value = "Mismatches";
+        summaryK.Cell(1, 9).Value = "Only In Source";
+        summaryK.Cell(1, 10).Value = "Only In Target";
+        summaryK.Cell(1, 11).Value = "Skipped (Empty Key)";
+        summaryK.Cell(1, 12).Value = "Notes";
+        summaryK.Cell(2, 1).Value = sourceEnvUrl;
+        summaryK.Cell(2, 2).Value = targetEnvUrl;
+        summaryK.Cell(2, 3).Value = comparisonTimestampUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+        summaryK.Cell(2, 4).Value = entityLogicalName;
+        summaryK.Cell(2, 5).Value = primaryNameAttr;
+        summaryK.Cell(2, 6).Value = Truncate(string.Join(',', report.ComparedFields));
+        summaryK.Cell(2, 7).Value = report.MatchingRecordKeys_K.Count;
+        summaryK.Cell(2, 8).Value = report.Mismatches_K.Count;
+        summaryK.Cell(2, 9).Value = report.OnlyInSource_K.Count;
+        summaryK.Cell(2, 10).Value = report.OnlyInTarget_K.Count;
+        summaryK.Cell(2, 11).Value = report.SkippedRecordsWithEmptyKey_K;
+        string summaryKNotes = string.IsNullOrWhiteSpace(primaryNameAttr) 
+            ? "Key-based comparison skipped (PrimaryNameAttribute not available)" 
+            : (report.AllRecordsHaveEmptyPrimaryKey_K ? "All records have empty primary key values" : string.Empty);
+        summaryK.Cell(2, 12).Value = summaryKNotes;
+        // Highlight row in red if all records have empty primary key values
+        if (report.AllRecordsHaveEmptyPrimaryKey_K)
+        {
+            summaryK.Row(2).Style.Fill.BackgroundColor = XLColor.Red;
+            summaryK.Row(2).Style.Font.FontColor = XLColor.White;
+        }
+        summaryK.Columns().AdjustToContents();
+
+        // MatchingRecords_K sheet
+        var matchWsK = wb.Worksheets.Add("MatchingRecords_K");
+        matchWsK.Cell(1, 1).Value = "Entity";
+        matchWsK.Cell(1, 2).Value = "RecordKey";
+        matchWsK.Cell(1, 3).Value = "SourceRecordId";
+        matchWsK.Cell(1, 4).Value = "TargetRecordId";
+        matchWsK.Cell(1, 5).Value = "SourceRecordUrl";
+        matchWsK.Cell(1, 6).Value = "TargetRecordUrl";
+        int rowK = 2;
+        foreach (var key in report.MatchingRecordKeys_K)
+        {
+            if (report.MatchingRecordIdsByKey_K.TryGetValue(key, out var ids))
+            {
+                matchWsK.Cell(rowK, 1).Value = entityLogicalName;
+                matchWsK.Cell(rowK, 2).Value = Truncate(key);
+                matchWsK.Cell(rowK, 3).Value = ids.SourceId.ToString();
+                matchWsK.Cell(rowK, 4).Value = ids.TargetId.ToString();
+                matchWsK.Cell(rowK, 5).Value = BuildRecordUrl(sourceEnvUrl, entityLogicalName, ids.SourceId);
+                matchWsK.Cell(rowK, 6).Value = BuildRecordUrl(targetEnvUrl, entityLogicalName, ids.TargetId);
+                rowK++;
+            }
+        }
+        matchWsK.Columns().AdjustToContents();
+
+        // Mismatches_K sheet
+        var mismatchWsK = wb.Worksheets.Add("Mismatches_K");
+        mismatchWsK.Cell(1, 1).Value = "Entity";
+        mismatchWsK.Cell(1, 2).Value = "RecordKey";
+        mismatchWsK.Cell(1, 3).Value = "SourceRecordId";
+        mismatchWsK.Cell(1, 4).Value = "TargetRecordId";
+        mismatchWsK.Cell(1, 5).Value = "SourceRecordUrl";
+        mismatchWsK.Cell(1, 6).Value = "TargetRecordUrl";
+        mismatchWsK.Cell(1, 7).Value = "FieldNames";
+        mismatchWsK.Cell(1, 8).Value = "SourceValues";
+        mismatchWsK.Cell(1, 9).Value = "TargetValues";
+        int rK = 2;
+        foreach (var grp in report.Mismatches_K.GroupBy(m => m.RecordKey))
+        {
+            var recordKey = grp.Key;
+            var first = grp.First();
+            var fieldNames = string.Join(',', grp.Select(g => g.FieldName));
+            var sourceVals = string.Join(" | ", grp.Select(g => Truncate(g.SourceValue?.ToString())));
+            var targetVals = string.Join(" | ", grp.Select(g => Truncate(g.TargetValue?.ToString())));
+            mismatchWsK.Cell(rK, 1).Value = entityLogicalName;
+            mismatchWsK.Cell(rK, 2).Value = Truncate(recordKey);
+            mismatchWsK.Cell(rK, 3).Value = first.SourceRecordId?.ToString() ?? string.Empty;
+            mismatchWsK.Cell(rK, 4).Value = first.TargetRecordId?.ToString() ?? string.Empty;
+            mismatchWsK.Cell(rK, 5).Value = first.SourceRecordId.HasValue ? BuildRecordUrl(sourceEnvUrl, entityLogicalName, first.SourceRecordId.Value) : string.Empty;
+            mismatchWsK.Cell(rK, 6).Value = first.TargetRecordId.HasValue ? BuildRecordUrl(targetEnvUrl, entityLogicalName, first.TargetRecordId.Value) : string.Empty;
+            mismatchWsK.Cell(rK, 7).Value = Truncate(fieldNames);
+            mismatchWsK.Cell(rK, 8).Value = Truncate(sourceVals);
+            mismatchWsK.Cell(rK, 9).Value = Truncate(targetVals);
+            rK++;
+        }
+        mismatchWsK.Columns().AdjustToContents();
+
+        // OnlyInSource_K sheet
+        void WriteRecordKeyOnly_K(string sheetName, List<Dictionary<string, object?>> records, bool isSource)
+        {
+            var ws = wb.Worksheets.Add(sheetName);
+            ws.Cell(1, 1).Value = "Entity";
+            ws.Cell(1, 2).Value = "RecordKey";
+            ws.Cell(1, 3).Value = "RecordId";
+            ws.Cell(1, 4).Value = isSource ? "SourceRecordUrl" : "TargetRecordUrl";
+            int row = 2;
+            string pk = entityLogicalName + "id";
+            var distinctKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rec in records)
+            {
+                string? keyVal = null;
+                if (!string.IsNullOrWhiteSpace(primaryNameAttr) && rec.TryGetValue(primaryNameAttr, out var kv) && kv != null)
+                    keyVal = kv.ToString()?.Trim();
+                if (string.IsNullOrWhiteSpace(keyVal)) continue;
+                if (!distinctKeys.Add(keyVal)) continue; // skip duplicates
+                rec.TryGetValue(pk, out var idVal);
+                Guid.TryParse(idVal?.ToString(), out var gid);
+                ws.Cell(row, 1).Value = entityLogicalName;
+                ws.Cell(row, 2).Value = Truncate(keyVal);
+                ws.Cell(row, 3).Value = gid != Guid.Empty ? gid.ToString() : string.Empty;
+                ws.Cell(row, 4).Value = gid != Guid.Empty ? BuildRecordUrl(isSource ? sourceEnvUrl : targetEnvUrl, entityLogicalName, gid) : string.Empty;
+                row++;
+            }
+            ws.Columns().AdjustToContents();
+        }
+        WriteRecordKeyOnly_K("OnlyInSource_K", report.OnlyInSource_K, true);
+        WriteRecordKeyOnly_K("OnlyInTarget_K", report.OnlyInTarget_K, false);
+
         // Child diffs (unchanged)
         foreach (var child in report.ChildDiffs.Values)
         {
@@ -1814,7 +1990,7 @@ public class ConfigurationComparisionFunction
         try
         {
             var uri = new Uri(envUrl);
-            var host = uri.Host; // e.g. mash.crm.dynamics.com or mashppe.crm.dynamics.com
+            var host = uri.Host; // e.g. contoso.crm.dynamics.com
             var firstDot = host.IndexOf('.', StringComparison.OrdinalIgnoreCase);
             if (firstDot > 0) return host.Substring(0, firstDot);
             return host; // fallback
@@ -1831,47 +2007,6 @@ public class ConfigurationComparisionFunction
         var tgtShort = ExtractEnvShortName(targetEnvUrl);
         var ts = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
         return $"D365Config_Comparision_{srcShort}_Vs_{tgtShort}_{ts}.xlsx";
-    }
-
-    private static async Task<string> UploadExcelWithFlexibleAuthAsync(byte[] bytes, string blobName, string? accountUrl = null, string? containerName = null, TokenCredential? credential = null, string? connectionString = null, string? containerSasUrl = null)
-    {
-        BlobContainerClient containerClient;
-        if (!string.IsNullOrWhiteSpace(containerSasUrl))
-        {
-            var raw = containerSasUrl.Trim();
-            // Provide clearer validation so caller knows required format
-            if (!raw.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !raw.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new ArgumentException("StorageContainerSasUrl must be a full https URL to the container, e.g. https://<account>.blob.core.windows.net/<container>?<sas>");
-            }
-            if (!Uri.TryCreate(raw, UriKind.Absolute, out var sasUri))
-            {
-                throw new ArgumentException("StorageContainerSasUrl is not a valid absolute URI after trimming.");
-            }
-            if (string.IsNullOrEmpty(sasUri.Query))
-            {
-                throw new ArgumentException("StorageContainerSasUrl is missing SAS query parameters.");
-            }
-            containerClient = new BlobContainerClient(sasUri);
-        }
-        else if (!string.IsNullOrWhiteSpace(connectionString) && !string.IsNullOrWhiteSpace(containerName))
-        {
-            containerClient = new BlobServiceClient(connectionString).GetBlobContainerClient(containerName);
-        }
-        else if (!string.IsNullOrWhiteSpace(accountUrl) && credential != null && !string.IsNullOrWhiteSpace(containerName))
-        {
-            containerClient = new BlobServiceClient(new Uri(accountUrl), credential).GetBlobContainerClient(containerName);
-        }
-        else
-        {
-            throw new InvalidOperationException("Insufficient storage parameters provided.");
-        }
-        if (!string.IsNullOrWhiteSpace(connectionString) || (!string.IsNullOrWhiteSpace(accountUrl) && credential != null))
-            await containerClient.CreateIfNotExistsAsync();
-        using var ms = new System.IO.MemoryStream(bytes);
-        var blob = containerClient.GetBlobClient(blobName);
-        await blob.UploadAsync(ms, overwrite: true);
-        return blob.Uri.ToString();
     }
 
     private static async Task<List<Dictionary<string, object?>>> FetchChildRecordsAsync(ILogger logger, string envUrl, string childEntityLogicalName, string parentFieldLogicalName, IEnumerable<string> childFields, string accessToken, bool onlyActive, Guid correlationId)

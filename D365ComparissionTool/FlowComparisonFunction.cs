@@ -118,18 +118,7 @@ public class FlowComparisonFunction
                     targetHosts.AddRange(targetsRaw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
                 }
             }
-            if (targetHosts.Count == 0)
-            {
-                // Fallback predefined targets (as requested)
-                var predefined = new[]
-                {
-                    "https://mashppe.crm.dynamics.com/",
-                    "https://mashtest.crm.dynamics.com/",
-                    "https://mashrb.crm.dynamics.com/",
-                    "https://mashdemo.crm.dynamics.com/"
-                };
-                foreach (var p in predefined) targetHosts.Add(p);
-            }
+            // No hardcoded fallback targets; require FLOW_TARGET_ENV_LIST or handle single target via SOURCE/TARGET envs.
             targetHosts = targetHosts.Select(h => NormalizeEnvHost(h)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             _logger.LogInformation("[{CorrelationId}] Flow weekly comparison SourceHost={SourceHost} TargetCount={Count} Targets={Targets}", correlationId, srcHost, targetHosts.Count, string.Join(',', targetHosts));
 
@@ -192,26 +181,15 @@ public class FlowComparisonFunction
                     try
                     {
                         var wbBytes = BuildFlowComparisonExcel(env1Flows, env2Flows, comparisons, srcHost, tgtHost, DateTime.UtcNow);
-                        string storageUrl = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL") ?? string.Empty;
-                        string containerName = Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER") ?? "comparissiontooloutput";
                         string blobName = GenerateFlowBlobName(srcHost, tgtHost, null);
-                        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONTAINER_SAS_URL")))
+                        string sas = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONTAINER_SAS_URL") ?? string.Empty;
+                        if (!string.IsNullOrWhiteSpace(sas))
                         {
-                            var sas = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONTAINER_SAS_URL");
                             excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, containerSasUrl: sas);
-                        }
-                        else if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONNECTION_STRING")))
-                        {
-                            var cs = Environment.GetEnvironmentVariable("COMPARISON_STORAGE_CONNECTION_STRING");
-                            excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, connectionString: cs, containerName: containerName);
-                        }
-                        else if (!string.IsNullOrWhiteSpace(storageUrl))
-                        {
-                            excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, accountUrl: storageUrl, containerName: containerName, credential: credential);
                         }
                         else
                         {
-                            _logger.LogWarning("[{CorrelationId}] No storage configuration provided; Excel not uploaded for target={TargetHost}", correlationId, tgtHost);
+                            _logger.LogWarning("[{CorrelationId}] SAS URL missing; Excel not uploaded for target={TargetHost}", correlationId, tgtHost);
                         }
                         if (!string.IsNullOrWhiteSpace(excelBlobUrl))
                         {
@@ -233,287 +211,6 @@ public class FlowComparisonFunction
         {
             _logger.LogError(ex, "[CompareFlowsWeekly] Unhandled error CorrelationId={CorrelationId}", correlationId);
         }
-    }
-
-    [Function("CompareFlows")] // HTTP trigger for flow comparison
-    public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Function, "post", Route = "CompareFlows")] HttpRequestData req, FunctionContext ctx)
-    {
-        var correlationId = Guid.NewGuid();
-        _logger.LogInformation("[CompareFlows] Start CorrelationId={CorrelationId}", correlationId);
-        FlowComparisonRequestPayload payload;
-        try
-        {
-            string body = await new StreamReader(req.Body).ReadToEndAsync();
-            payload = JsonSerializer.Deserialize<FlowComparisonRequestPayload>(body, JsonOptions) ?? new FlowComparisonRequestPayload();
-            _logger.LogDebug("[CompareFlows:{CorrelationId}] Raw body length={BodyLength}", correlationId, body.Length);
-        }
-        catch (Exception ex)
-        {
-            var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            await bad.WriteStringAsync("Invalid JSON payload: " + ex.Message);
-            return bad;
-        }
-
-        string mode = payload.Mode?.Trim().ToLowerInvariant() ?? "all";
-        if (string.IsNullOrWhiteSpace(payload.Env))
-        {
-            var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            await bad.WriteStringAsync("Missing 'env' value.");
-            return bad;
-        }
-
-        string env1 = NormalizeEnvHost(payload.Env!);
-        string? env2 = string.IsNullOrWhiteSpace(payload.Env2) ? null : NormalizeEnvHost(payload.Env2!);
-        _logger.LogInformation("[CompareFlows:{CorrelationId}] Mode={Mode} Env1={Env1} Env2={Env2} MatchBy={MatchBy} IncludeDiffDetails={IncludeDiffDetails}", correlationId, mode, env1, env2 ?? "(none)", payload.MatchBy ?? "name", payload.IncludeDiffDetails);
-
-        // Primary token now expected in body as token1; fallback to Authorization header if omitted.
-        string token1 = (payload.Token1 ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(token1)) token1 = ExtractBearerToken(req).Trim();
-        if (string.IsNullOrWhiteSpace(token1))
-        {
-            var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            await bad.WriteStringAsync("token1 (primary environment bearer) is required in body or Authorization header.");
-            return bad;
-        }
-        string? token2 = payload.Token2?.Trim();
-        if (env2 != null && string.IsNullOrWhiteSpace(token2))
-        {
-            var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-            await bad.WriteStringAsync("token2 required when env2 provided.");
-            return bad;
-        }
-
-        // Validate modes
-        if (mode is "single")
-        {
-            if (string.IsNullOrWhiteSpace(payload.FlowId) && string.IsNullOrWhiteSpace(payload.FlowName))
-            {
-                var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-                await bad.WriteStringAsync("single mode requires flowId or flowName");
-                return bad;
-            }
-        }
-        else if (mode is "list")
-        {
-            if (payload.Flows == null || payload.Flows.Count == 0)
-            {
-                var bad = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
-                await bad.WriteStringAsync("list mode requires 'flows' array of names or GUIDs");
-                return bad;
-            }
-        }
-
-        var ignoreKeysConfig = Environment.GetEnvironmentVariable("NORMALIZE_IGNORE_KEYS") ?? string.Empty;
-        var ignoreKeys = ignoreKeysConfig.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(k => k.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        if (ignoreKeys.Count == 0)
-        {
-            ignoreKeys.AddRange(new[] { "connectionReferences", "runtimeConfiguration", "lastModified", "createdTime", "modifiedTime", "etag", "trackedProperties" });
-        }
-
-        var env1Flows = new List<FlowSnapshot>();
-        var env2Flows = new List<FlowSnapshot>();
-        string notes = string.Empty;
-        var fetchStart = DateTime.UtcNow;
-        bool env1AuthFailed = false;
-        bool env2AuthFailed = false;
-
-        try
-        {
-            if (mode == "all")
-            {
-                try
-                {
-                    env1Flows = await FetchAndPrepareAllFlows(env1, token1, ignoreKeys, correlationId);
-                }
-                catch (HttpRequestException hex) when (hex.Message.Contains("401"))
-                {
-                    env1AuthFailed = true; notes += " Env1 unauthorized.";
-                }
-                if (env2 != null)
-                {
-                    try { env2Flows = await FetchAndPrepareAllFlows(env2, token2!, ignoreKeys, correlationId); }
-                    catch (HttpRequestException hex) when (hex.Message.Contains("401"))
-                    { env2AuthFailed = true; notes += " Env2 unauthorized."; }
-                }
-            }
-            else if (mode == "single")
-            {
-                string identifier = payload.FlowId ?? payload.FlowName!;
-                _logger.LogInformation("[CompareFlows:{CorrelationId}] Single identifier={Identifier}", correlationId, identifier);
-                try
-                {
-                    var snap1 = await FetchSingleFlow(env1, token1, identifier, ignoreKeys, correlationId);
-                    if (snap1 != null) env1Flows.Add(snap1);
-                }
-                catch (HttpRequestException hex) when (hex.Message.Contains("401"))
-                {
-                    env1AuthFailed = true; notes += " Env1 unauthorized.";
-                }
-                if (env2 != null)
-                {
-                    try
-                    {
-                        var snap2 = await FetchSingleFlow(env2, token2!, identifier, ignoreKeys, correlationId, payload.MatchBy);
-                        if (snap2 != null) env2Flows.Add(snap2);
-                    }
-                    catch (HttpRequestException hex) when (hex.Message.Contains("401"))
-                    {
-                        env2AuthFailed = true; notes += " Env2 unauthorized.";
-                    }
-                }
-            }
-            else if (mode == "list")
-            {
-                _logger.LogInformation("[CompareFlows:{CorrelationId}] List mode count={Count}", correlationId, payload.Flows!.Count);
-                foreach (var f in payload.Flows!)
-                {
-                    try
-                    {
-                        var s = await FetchSingleFlow(env1, token1, f, ignoreKeys, correlationId);
-                        if (s != null) env1Flows.Add(s);
-                    }
-                    catch (HttpRequestException hex) when (hex.Message.Contains("401"))
-                    {
-                        env1AuthFailed = true; notes += " Env1 unauthorized."; break; // stop further attempts
-                    }
-                }
-                if (env2 != null)
-                {
-                    foreach (var f in payload.Flows!)
-                    {
-                        if (env2AuthFailed) break;
-                        try
-                        {
-                            var s = await FetchSingleFlow(env2, token2!, f, ignoreKeys, correlationId);
-                            if (s != null) env2Flows.Add(s);
-                        }
-                        catch (HttpRequestException hex) when (hex.Message.Contains("401"))
-                        {
-                            env2AuthFailed = true; notes += " Env2 unauthorized."; break;
-                        }
-                    }
-                }
-            }
-            else
-            {
-                notes = "Unknown mode; defaulted to all.";
-                try { env1Flows = await FetchAndPrepareAllFlows(env1, token1, ignoreKeys, correlationId); }
-                catch (HttpRequestException hex) when (hex.Message.Contains("401")) { env1AuthFailed = true; notes += " Env1 unauthorized."; }
-                if (env2 != null)
-                {
-                    try { env2Flows = await FetchAndPrepareAllFlows(env2, token2!, ignoreKeys, correlationId); }
-                    catch (HttpRequestException hex) when (hex.Message.Contains("401")) { env2AuthFailed = true; notes += " Env2 unauthorized."; }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "[CompareFlows:{CorrelationId}] Fetch failure", correlationId);
-            var errResp = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
-            await errResp.WriteStringAsync("Flow fetch failed: " + ex.Message);
-            return errResp;
-        }
-        var fetchDurationMs = (int)(DateTime.UtcNow - fetchStart).TotalMilliseconds;
-        _logger.LogInformation("[CompareFlows:{CorrelationId}] Fetch+Prepare completed Env1Count={Env1Count} Env2Count={Env2Count} DurationMs={Duration}", correlationId, env1Flows.Count, env2Flows.Count, fetchDurationMs);
-
-        var comparisons = new List<FlowComparisonResult>();
-        var comparisonTimestampUtc = DateTime.UtcNow;
-        if (env2 != null)
-        {
-            string matchBy = (payload.MatchBy?.Trim().ToLowerInvariant()) switch
-            {
-                "id" => "id",
-                _ => "name"
-            };
-            var env2LookupByName = env2Flows.GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
-            var env2LookupById = env2Flows.ToDictionary(f => f.FlowId, f => f);
-
-            foreach (var f1 in env1Flows)
-            {
-                FlowSnapshot? f2 = null;
-                if (matchBy == "id") env2LookupById.TryGetValue(f1.FlowId, out f2);
-                else env2LookupByName.TryGetValue(f1.Name, out f2);
-                if (f2 == null)
-                {
-                    comparisons.Add(new FlowComparisonResult(f1.Name, f1, null, false, null, null, "missing_in_env2"));
-                    _logger.LogDebug("[CompareFlows:{CorrelationId}] MissingInEnv2 Name={Name} Id={Id}", correlationId, f1.Name, f1.FlowId);
-                    continue;
-                }
-                if (!string.IsNullOrEmpty(f1.Error) || !string.IsNullOrEmpty(f2.Error))
-                {
-                    comparisons.Add(new FlowComparisonResult(f1.Name, f1, f2, false, null, null, "error"));
-                    _logger.LogWarning("[CompareFlows:{CorrelationId}] Error snapshot Name={Name} Env1Error={E1} Env2Error={E2}", correlationId, f1.Name, f1.Error, f2.Error);
-                    continue;
-                }
-                bool identical = string.Equals(f1.Hash, f2.Hash, StringComparison.OrdinalIgnoreCase);
-                FlowComparisonDiff? diff = null;
-                List<FlowActionDifference>? actionDiffs = null;
-                if (!identical && payload.IncludeDiffDetails)
-                {
-                    diff = ComputeDiff(f1.CanonicalJson, f2.CanonicalJson);
-                    _logger.LogDebug("[CompareFlows:{CorrelationId}] Diff Name={Name} Added={Added} Removed={Removed} Changed={Changed}", correlationId, f1.Name, diff.Added.Count, diff.Removed.Count, diff.Changed.Count);
-                    actionDiffs = ComputeActionDifferences(f1.CanonicalJson, f2.CanonicalJson);
-                    if (actionDiffs != null && actionDiffs.Count > 0)
-                    {
-                        _logger.LogDebug("[CompareFlows:{CorrelationId}] ActionDiffs Name={Name} NonMatchingActions={Count}", correlationId, f1.Name, actionDiffs.Count);
-                    }
-                }
-                comparisons.Add(new FlowComparisonResult(f1.Name, f1, f2, identical, diff, actionDiffs, identical ? "identical" : "different"));
-            }
-        }
-
-        int identicalCount = comparisons.Count(c => c.Identical); // retained for logging only
-        int differentCount = comparisons.Count(c => c.Status == "different"); // retained for logging only
-        int missingCount = comparisons.Count(c => c.Status == "missing_in_env2");
-        int errorCount = comparisons.Count(c => c.Status == "error");
-        var identicalFlows = comparisons.Where(c => c.Identical).Select(c => c.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        var nonIdenticalFlows = comparisons.Where(c => c.Status == "different").Select(c => c.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        // Excel build & upload
-        string? excelBlobUrl = null;
-        try
-        {
-            var wbBytes = BuildFlowComparisonExcel(env1Flows, env2Flows, comparisons, env1, env2, comparisonTimestampUtc);
-            string storageUrl = payload.StorageAccountUrl ?? Environment.GetEnvironmentVariable("COMPARISON_STORAGE_URL") ?? string.Empty;
-            string containerName = payload.OutputContainerName ?? Environment.GetEnvironmentVariable("COMPARISON_OUTPUT_CONTAINER") ?? "comparissiontooloutput";
-            string blobName = GenerateFlowBlobName(env1, env2, payload.OutputFileName);
-            if (!string.IsNullOrWhiteSpace(payload.StorageContainerSasUrl))
-                excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, containerSasUrl: payload.StorageContainerSasUrl);
-            else if (!string.IsNullOrWhiteSpace(payload.StorageConnectionString))
-                excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, connectionString: payload.StorageConnectionString, containerName: containerName);
-            else if (!string.IsNullOrWhiteSpace(storageUrl))
-            {
-                var credential = new DefaultAzureCredential();
-                excelBlobUrl = await UploadExcelWithFlexibleAuthAsync(wbBytes, blobName, accountUrl: storageUrl, containerName: containerName, credential: credential);
-            }
-            else
-            {
-                notes += (string.IsNullOrEmpty(notes) ? string.Empty : " ") + "No storage configuration provided; Excel not uploaded.";
-            }
-            if (!string.IsNullOrWhiteSpace(excelBlobUrl))
-                _logger.LogInformation("[CompareFlows:{CorrelationId}] Excel uploaded BlobUrl={BlobUrl} SizeBytes={Size}", correlationId, excelBlobUrl, wbBytes.Length);
-        }
-        catch (Exception exUp)
-        {
-            _logger.LogError(exUp, "[CompareFlows:{CorrelationId}] Excel generation/upload failed", correlationId);
-            notes += (string.IsNullOrEmpty(notes) ? string.Empty : " ") + "Excel generation/upload failed: " + exUp.Message;
-        }
-        var responseObj = new FlowComparisonResponse(env1Flows, env2Flows, comparisons, identicalFlows, nonIdenticalFlows, missingCount, errorCount, notes, excelBlobUrl, env1AuthFailed, env2AuthFailed);
-        var resp = req.CreateResponse(System.Net.HttpStatusCode.OK);
-        resp.Headers.Add("Content-Type", "application/json");
-        await resp.WriteStringAsync(JsonSerializer.Serialize(responseObj, new JsonSerializerOptions { WriteIndented = true }));
-        _logger.LogInformation("[CompareFlows] Completed CorrelationId={CorrelationId} Env1Flows={Env1Count} Env2Flows={Env2Count} Identical={Identical} Different={Different} MissingEnv2={Missing} Errors={Errors}", correlationId, env1Flows.Count, env2Flows.Count, identicalCount, differentCount, missingCount, errorCount);
-        return resp;
-    }
-
-    private static string ExtractBearerToken(HttpRequestData req)
-    {
-        if (req.Headers.TryGetValues("Authorization", out var authValues))
-        {
-            var bearer = authValues.FirstOrDefault(v => v.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase));
-            if (bearer != null) return bearer.Substring(7).Trim();
-        }
-        return string.Empty;
     }
 
     private static string NormalizeEnvHost(string env)
@@ -561,7 +258,7 @@ public class FlowComparisonFunction
     private async Task<List<RawFlow>> FetchFlowsRaw(string env, string token, Guid correlationId, string? singleIdentifier = null)
     {
         var client = new HttpClient();
-        // Add headers required by Dataverse for some endpoints to avoid 400/415 issues
+        // Add required OData and User-Agent headers for Dataverse API
         if (!client.DefaultRequestHeaders.Contains("OData-MaxVersion"))
             client.DefaultRequestHeaders.Add("OData-MaxVersion", "4.0");
         if (!client.DefaultRequestHeaders.Contains("OData-Version"))
@@ -570,8 +267,7 @@ public class FlowComparisonFunction
             client.DefaultRequestHeaders.Add("User-Agent", "D365ComparisonTool/1.0");
         client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
         client.DefaultRequestHeaders.Accept.ParseAdd("application/json");
-        // Use Dataverse workflows entity (holds cloud flow definitions) selecting workflowid,name,clientdata
-        // Category 5 corresponds to modern (cloud) flows; include filter when not doing single workflowid lookup by GUID
+        // Query workflows entity (cloud flows); category 5 = modern flows
         string baseUrl = $"https://{env.TrimEnd('/')}/api/data/v9.2/workflows?$select=workflowid,name,clientdata&$filter=category eq 5";
         _logger.LogInformation("[CompareFlows:{CorrelationId}] FetchFlowsRaw start Env={Env} SingleIdentifier={Identifier}", correlationId, env, singleIdentifier ?? "(all)");
         if (!string.IsNullOrWhiteSpace(singleIdentifier))
