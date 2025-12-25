@@ -6,6 +6,9 @@
     <OutputType>Exe</OutputType>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Deployment settings to avoid timeout and conflict issues -->
+    <SCMDOBuildDuringDeployment>false</SCMDOBuildDuringDeployment>
+    <RunFromPackage>1</RunFromPackage>
   </PropertyGroup>
 
   <ItemGroup>
