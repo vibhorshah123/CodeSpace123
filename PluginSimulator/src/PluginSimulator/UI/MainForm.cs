@@ -17,11 +17,12 @@ namespace PluginSimulator.UI
         private TextBox txtEnvUrl, txtEntity, txtRecordId, txtAssemblyPath, txtPluginType, txtChangedFields, txtPreImageName;
         private ComboBox cboMessage, cboStage;
         private CheckBox chkDebug;
-        private Button btnBrowse, btnRun, btnClear, btnAudit;
+        private Button btnBrowse, btnRun, btnClear, btnAudit, btnReplayDialog;
         private RichTextBox rtbOutput;
         private System.Windows.Forms.Label lblStatus, lblAuditStatus;
         private bool _isRunning;
         private AuditEntry _loadedAuditEntry;
+        private List<FieldDelta> _configuredDeltas;
         private IOrganizationService _cachedService;
         private string _cachedEnvUrl;
 
@@ -72,6 +73,16 @@ namespace PluginSimulator.UI
             };
             btnAudit.Click += BtnAudit_Click;
             topPanel.Controls.Add(btnAudit);
+
+            btnReplayDialog = new Button
+            {
+                Text = "🕒 Build from Audit (popup)",
+                Left = 520, Top = y, Width = 200, Height = 23,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(232, 244, 252)
+            };
+            btnReplayDialog.Click += BtnReplayDialog_Click;
+            topPanel.Controls.Add(btnReplayDialog);
 
             y += 30;
             lblAuditStatus = new System.Windows.Forms.Label
@@ -301,6 +312,96 @@ namespace PluginSimulator.UI
             }
         }
 
+        private async void BtnReplayDialog_Click(object sender, EventArgs e)
+        {
+            var envUrl = txtEnvUrl.Text.Trim();
+            var entity = txtEntity.Text.Trim();
+            var recordIdStr = txtRecordId.Text.Trim();
+            var messageName = cboMessage.SelectedItem?.ToString() ?? "Update";
+            var stage = GetStageValue();
+
+            if (string.IsNullOrWhiteSpace(envUrl) || string.IsNullOrWhiteSpace(entity) || string.IsNullOrWhiteSpace(recordIdStr))
+            {
+                MessageBox.Show("Fill in Environment URL, Entity, and Record ID first.",
+                    "Missing Fields", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (!Guid.TryParse(recordIdStr, out var recordGuid))
+            {
+                MessageBox.Show("Record ID must be a valid GUID.",
+                    "Invalid Record ID", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            btnReplayDialog.Enabled = false;
+            btnReplayDialog.Text = "⏳ Loading...";
+            lblAuditStatus.ForeColor = Color.DimGray;
+            lblAuditStatus.Text = "Connecting to D365 and loading audit + current record...";
+
+            List<AuditEntry> entries = null;
+            Entity currentRecord = null;
+            string errorMsg = null;
+
+            try
+            {
+                await Task.Run(() =>
+                {
+                    if (_cachedService == null || _cachedEnvUrl != envUrl)
+                    {
+                        _cachedService = AuthManager.Connect(envUrl);
+                        _cachedEnvUrl = envUrl;
+                    }
+                    entries = AuditLoader.LoadRecentChanges(_cachedService, entity, recordGuid);
+                    try
+                    {
+                        currentRecord = _cachedService.Retrieve(entity, recordGuid,
+                            new Microsoft.Xrm.Sdk.Query.ColumnSet(true));
+                    }
+                    catch
+                    {
+                        // Record may not exist (Create simulation) — preview pane will handle null.
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                errorMsg = ex.Message;
+            }
+
+            btnReplayDialog.Enabled = true;
+            btnReplayDialog.Text = "🕒 Build from Audit (popup)";
+
+            if (errorMsg != null)
+            {
+                lblAuditStatus.ForeColor = Color.Red;
+                lblAuditStatus.Text = $"❌ {errorMsg}";
+                return;
+            }
+
+            using (var dlg = new AuditReplayDialog(
+                entries ?? new List<AuditEntry>(),
+                currentRecord,
+                entity,
+                recordGuid,
+                messageName,
+                stage))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+                _configuredDeltas = dlg.ConfiguredDeltas;
+
+                if (_configuredDeltas == null || _configuredDeltas.Count == 0)
+                {
+                    lblAuditStatus.ForeColor = Color.DarkOrange;
+                    lblAuditStatus.Text = "⚠ Dialog returned no deltas — will fall back to legacy path.";
+                    return;
+                }
+
+                lblAuditStatus.ForeColor = Color.DarkGreen;
+                lblAuditStatus.Text = $"🕒 {_configuredDeltas.Count} delta(s) configured — Target/PreImage/PostImage will be reconstructed.";
+            }
+        }
+
         private async void BtnRun_Click(object sender, EventArgs e)
         {
             if (_isRunning)
@@ -345,6 +446,13 @@ namespace PluginSimulator.UI
             {
                 foreach (var attr in _loadedAuditEntry.OldValue.Attributes)
                     config.PreImageOverrides[attr.Key] = attr.Value;
+            }
+
+            // If the audit-driven popup configured deltas, hand them off — ContextBuilder will
+            // delegate to ContextReconstructor and ignore ChangedFields / PreImageOverrides.
+            if (_configuredDeltas != null && _configuredDeltas.Count > 0)
+            {
+                config.Deltas = _configuredDeltas;
             }
 
             // Parse changed fields

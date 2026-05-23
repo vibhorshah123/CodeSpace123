@@ -42,7 +42,11 @@ namespace PluginSimulator.Execution
                 OrganizationName = "SimulatedOrg"
             };
 
-            if (config.MessageName.Equals("Create", StringComparison.OrdinalIgnoreCase))
+            if (config.Deltas != null && config.Deltas.Count > 0)
+            {
+                BuildFromDeltas(context, config, fullRecord, recordId);
+            }
+            else if (config.MessageName.Equals("Create", StringComparison.OrdinalIgnoreCase))
             {
                 // For Create: the full record IS the target
                 context.InputParameters["Target"] = fullRecord;
@@ -133,6 +137,62 @@ namespace PluginSimulator.Execution
             }
 
             return context;
+        }
+
+        /// <summary>
+        /// Audit-driven path: reconstructs Target / PreImage / PostImage from FieldDelta entries
+        /// using ContextReconstructor (which enforces the MS Learn stage-message matrix).
+        /// </summary>
+        private static void BuildFromDeltas(
+            Proxy.ProxyExecutionContext context,
+            SimulationConfig config,
+            Entity fullRecord,
+            Guid recordId)
+        {
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"  Mode: Audit-driven reconstruction ({config.Deltas.Count} delta(s))");
+            Console.ResetColor();
+
+            var rebuilt = ContextReconstructor.Reconstruct(
+                config.EntityLogicalName,
+                recordId,
+                fullRecord,
+                config.Deltas,
+                config.MessageName,
+                config.Stage);
+
+            // Target
+            if (config.MessageName.Equals("Delete", StringComparison.OrdinalIgnoreCase))
+            {
+                // Delete uses EntityReference as Target
+                context.InputParameters["Target"] = new EntityReference(config.EntityLogicalName, recordId);
+            }
+            else
+            {
+                context.InputParameters["Target"] = rebuilt.Target;
+            }
+            Console.WriteLine($"  Target: {(rebuilt.Target?.Attributes.Count ?? 0)} attribute(s)");
+
+            // PreImage (skip for Create per MS Learn)
+            if (rebuilt.PreImage != null)
+            {
+                context.PreEntityImages[config.PreImageName] = rebuilt.PreImage;
+                Console.WriteLine($"  PreImage '{config.PreImageName}': {rebuilt.PreImage.Attributes.Count} attribute(s)");
+            }
+
+            // PostImage (only PostOp + Create/Update per MS Learn)
+            if (rebuilt.PostImage != null)
+            {
+                context.PostEntityImages[config.PostImageName] = rebuilt.PostImage;
+                Console.WriteLine($"  PostImage '{config.PostImageName}': {rebuilt.PostImage.Attributes.Count} attribute(s)");
+            }
+            else if (config.Stage == 40 &&
+                     !config.MessageName.Equals("Delete", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine("  PostImage: not built (stage/message combination not eligible)");
+                Console.ResetColor();
+            }
         }
 
         private static void ApplyPreImageOverrides(Entity preImage, SimulationConfig config)
