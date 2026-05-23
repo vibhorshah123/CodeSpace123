@@ -1,0 +1,8 @@
+{
+  "EnvUrl": "https://mash.crm.dynamics.com/",
+  "Entity": "incident",
+  "AssemblyPath": "D:\\MASH On Dynamics\\Plugins\\MASHvNext.ServiceRequestRouting\\bin\\Debug\\MASHvNext.ServiceRequestRouting.dll",
+  "PluginType": "",
+  "RecordId": "2e070d33-2614-f111-8341-000d3a32f892",
+  "Message": "Update"
+}
